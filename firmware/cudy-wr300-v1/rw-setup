@@ -29,6 +29,12 @@ if [ -f /etc/routewolf/route.conf ]; then cp -p /etc/routewolf/route.conf /etc/r
 if [ "$iface" = off ]; then
  printf "VPN_ROUTE_DEV=''\nVPN_ROUTE_GW=''\nVPN_ROUTE_MTU='1280'\n" > /etc/routewolf/route.conf
  /etc/init.d/routewolf-watchdog disable
+ printf "WATCHDOG_TYPE='disabled'\nWATCHDOG_DEVICE=''\nWATCHDOG_UCI_IFACE=''\n" > /etc/routewolf/watchdog.conf
+ if [ -f /etc/crontabs/root ]; then
+  sed '\|/usr/sbin/routewolf-watchdog.sh check|d' /etc/crontabs/root > /etc/crontabs/root.rw-tmp &&
+   mv /etc/crontabs/root.rw-tmp /etc/crontabs/root || exit 1
+  /etc/init.d/cron restart
+ fi
  ip -4 route flush table 99 2>/dev/null || :
  ip -4 rule del fwmark 0x1/0x1 table 99 priority 100 2>/dev/null || :
  echo 'Выборочная маршрутизация отключена. VPN-интерфейсы не удалены.'

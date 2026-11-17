@@ -42,6 +42,11 @@ test -n "$IMAGE"
 ROOT=$(find "$IB/build_dir" -maxdepth 4 -type d -name 'root-ramips' -print -quit)
 test -n "$ROOT"
 python3 "$PROFILE_DIR/verify.py" --root "$ROOT" --image "$IMAGE" --profiles "$WORK/profiles.json" --output "$OUT"
+# Execute the actual MIPS routing utility against read-only host netlink queries.
+# This checks that the tiny variant still contains route/rule/link support.
+for object in rule route link; do
+  qemu-mipsel -L "$ROOT" "$ROOT/usr/libexec/ip-tiny" -4 "$object" show >> "$OUT/policy-routing-smoke.txt"
+done
 # Only a size/contents-checked candidate is exposed as a flashable .bin.
 cp "$IMAGE" "$OUT/cudy-wr300-v1-25.12.6-pocket-full-wg-awg-sysupgrade.bin"
 cp "$PROFILE_DIR/README.md" "$OUT/README.md"

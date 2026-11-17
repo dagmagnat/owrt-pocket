@@ -34,10 +34,9 @@ with tarfile.open(a.payload) as archive:
         dest.write_bytes(archive.extractfile(member).read())
         dest.chmod(0o755)
 
-for name in ('domains-dnsmasq-nfset.lst', 'ipv4.lst', 'ipv6.lst'):
-    dest = a.overlay / 'usr/share/routewolf/full-source' / name
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(a.source / 'lists' / name, dest)
+# The complete normalized lists are stored below. Raw source copies are build
+# artifacts; keeping both on this 8-MB device would waste compressed flash.
+shutil.rmtree(a.overlay / 'usr/share/routewolf/full-source', ignore_errors=True)
 
 cache = a.overlay / 'etc/routewolf/lists'
 cache.mkdir(parents=True, exist_ok=True)
