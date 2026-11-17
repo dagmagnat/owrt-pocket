@@ -17,6 +17,6 @@
     "-luci-app-attendedsysupgrade", "-attendedsysupgrade-common", "-luci-app-package-manager",
     "luci-i18n-base-ru", "luci-i18n-firewall-ru", "luci-proto-wireguard",
     "wireguard-tools", "kmod-wireguard", "kmod-amneziawg", "amneziawg-tools",
-    "luci-proto-amneziawg", "luci-i18n-amneziawg-ru", "ip-full", "rpcd-mod-iwinfo"
+    "luci-proto-amneziawg", "luci-i18n-amneziawg-ru", "-ip-full", "ip-tiny", "rpcd-mod-iwinfo"
   ]
 }

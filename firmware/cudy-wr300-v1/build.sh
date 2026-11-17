@@ -34,6 +34,7 @@ cp "$RW_SOURCE/lists/ipv4.lst" "$OUT/full-ipv4-source.lst"
 PACKAGES=$(python3 -c 'import json,sys;print(" ".join(json.load(open(sys.argv[1]))["packages"]))' "$PROFILE_DIR/profile.json")
 make -C "$IB" manifest PROFILE=cudy_wr300-v1 PACKAGES="$PACKAGES" > "$OUT/selected-packages.manifest"
 make -C "$IB" image PROFILE=cudy_wr300-v1 PACKAGES="$PACKAGES" FILES="$WORK/overlay" \
+  DISABLED_SERVICES="getdomains vpnroute routewolf-watchdog" \
   EXTRA_IMAGE_NAME=pocket-full-wg-awg BIN_DIR="$WORK/images"
 IMAGE=$(find "$WORK/images" -maxdepth 1 -type f -name '*cudy_wr300-v1*squashfs-sysupgrade.bin' -print -quit)
 test -n "$IMAGE"

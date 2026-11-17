@@ -28,6 +28,10 @@ assert list((a.root / 'usr/lib/lua/luci/i18n').glob('base.ru.lmo')) or list((a.r
 assert (a.root / 'etc/owrt-pocket/language').read_text().strip() == 'ru'
 assert (a.root / 'etc/routewolf/user.conf').read_text().find("LIST_PROFILE='full'") >= 0
 assert 'Cudy_WR-300' in (a.root / 'etc/uci-defaults/99-cudy-pocket').read_text()
+assert (a.root / 'usr/libexec/ip-tiny').is_file(), 'Policy-routing ip utility missing'
+assert not (a.root / 'usr/libexec/ip-full').exists(), 'Unexpected full ip utility'
+for service in ('getdomains', 'vpnroute', 'routewolf-watchdog'):
+    assert not list((a.root / 'etc/rc.d').glob('S*' + service)), 'Duplicate or premature startup: ' + service
 size = a.image.stat().st_size
 limit = profile['file_size_limits']['image']
 reserve = limit - size

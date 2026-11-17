@@ -178,6 +178,8 @@ uci commit firewall
 /etc/init.d/routewolf enable
 /etc/init.d/routewolf-route enable
 /etc/init.d/routewolf-watchdog disable
+/etc/init.d/getdomains disable
+/etc/init.d/vpnroute disable
 mkdir -p /etc/crontabs
 touch /etc/crontabs/root
 printf '0 2 * * * /usr/sbin/routewolf-update.sh --lists-auto >/tmp/routewolf-lists-update.log 2>&1\n0 3 * * * /usr/sbin/routewolf-update.sh --code-auto >/tmp/routewolf-code-update.log 2>&1\n*/5 * * * * /usr/sbin/routewolf-reliability.sh check >/tmp/routewolf-health.log 2>&1\n' >> /etc/crontabs/root
