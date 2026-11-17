@@ -14,6 +14,7 @@ build() {
  [ "$repo" != jsonpath ] || build_dir=$root/$repo-$revision
  cmake -S "$root/$repo-$revision" -B "$build_dir" \
   -DCMAKE_INSTALL_PREFIX="$prefix" -DCMAKE_INSTALL_LIBDIR=lib \
+  "-DCMAKE_EXE_LINKER_FLAGS=-L$prefix/lib" \
   -DCMAKE_PREFIX_PATH="$prefix" -DBUILD_LUA=OFF -DBUILD_EXAMPLES=OFF
  cmake --build "$build_dir" --parallel 2
  cmake --install "$build_dir"
