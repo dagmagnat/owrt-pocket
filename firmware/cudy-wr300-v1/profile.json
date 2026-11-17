@@ -1,0 +1,22 @@
+{
+  "release": "25.12.6",
+  "target": "ramips/mt76x8",
+  "profile": "cudy_wr300-v1",
+  "ssid": "Cudy_WR-300",
+  "wifi_encryption": "none",
+  "root_password": "empty",
+  "country": "00",
+  "routewolf_commit": "2f48db5c03ee2657fdd13a7f25978fbd0539ccc4",
+  "routewolf_version": "59",
+  "routewolf_archive_sha256": "1e7137952cc01453706d7168a640925df98613383f584119afddfad82bbdf3e0",
+  "imagebuilder_sha256": "7f26c50440cadd83362c444778f80f4a214ee76f3c192ef85ef074f2c56d89ec",
+  "awg_key_sha256": "b4517063ef2994e7ea4f9ec21e1a9f8160ed9707a9faebe394919edf862adbe8",
+  "minimum_estimated_overlay_bytes": 1048576,
+  "packages": [
+    "-dnsmasq", "dnsmasq-full", "-luci", "-luci-ssl", "luci-light", "px5g-mbedtls",
+    "-luci-app-attendedsysupgrade", "-attendedsysupgrade-common", "-luci-app-package-manager",
+    "luci-i18n-base-ru", "luci-i18n-firewall-ru", "luci-proto-wireguard",
+    "wireguard-tools", "kmod-wireguard", "kmod-amneziawg", "amneziawg-tools",
+    "luci-proto-amneziawg", "luci-i18n-amneziawg-ru", "ip-full", "rpcd-mod-iwinfo"
+  ]
+}

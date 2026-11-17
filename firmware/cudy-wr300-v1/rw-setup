@@ -1,0 +1,46 @@
+#!/bin/sh
+# Select an already configured WG/AWG interface. Does not change WAN/LAN/keys.
+set -u
+umask 077
+if [ "$(id -u)" != 0 ]; then echo 'Требуется root'; exit 1; fi
+iface=${1:-}
+if [ -z "$iface" ]; then
+ printf 'RouteWolf: 1 WireGuard wg0 | 2 AmneziaWG awg0 | 3 Отключить маршрутизацию | 0 Назад\n> '
+ IFS= read -r choice || exit 0
+ case "$choice" in 1) iface=wg0;; 2) iface=awg0;; 3) iface=off;; *) exit 0;; esac
+fi
+case "$iface" in wg0|awg0|off) :;; *) echo 'Используйте: rw-setup [wg0|awg0|off]'; exit 1;; esac
+if [ "$iface" != off ]; then
+ proto=$(uci -q get "network.$iface.proto") || { echo 'Сначала создайте интерфейс wg0/awg0 в LuCI и внесите конфигурацию VPN.'; exit 1; }
+ case "$proto" in wireguard|amneziawg|awg) :;; *) echo 'Это не WG/AWG интерфейс'; exit 1;; esac
+ # Full-tunnel routes in main would defeat selective routing and remote access.
+ for section in $(uci -q show network | sed -n "s/^network\.\([^.=]*\)=${proto}_${iface}$/\1/p"); do
+  if [ "$(uci -q get "network.$section.route_allowed_ips" 2>/dev/null)" = 1 ]; then
+   echo 'Снимите Route Allowed IPs у peer в LuCI. Основной маршрут должен остаться через WAN.'; exit 1
+  fi
+ done
+ if ip -4 route show default | grep -Eq " dev $iface( |$)"; then echo 'Основной маршрут уже идёт через VPN. Исправьте его перед включением RouteWolf.'; exit 1; fi
+fi
+printf 'Выбрано: %s. Для применения введите Yes: ' "$iface"
+IFS= read -r answer || exit 0
+[ "$answer" = Yes ] || exit 0
+mkdir -p /etc/routewolf
+if [ -f /etc/routewolf/route.conf ]; then cp -p /etc/routewolf/route.conf /etc/routewolf/route.conf.previous; fi
+if [ "$iface" = off ]; then
+ printf "VPN_ROUTE_DEV=''\nVPN_ROUTE_GW=''\nVPN_ROUTE_MTU='1280'\n" > /etc/routewolf/route.conf
+ /etc/init.d/routewolf-watchdog disable
+ ip -4 route flush table 99 2>/dev/null || :
+ ip -4 rule del fwmark 0x1/0x1 table 99 priority 100 2>/dev/null || :
+ echo 'Выборочная маршрутизация отключена. VPN-интерфейсы не удалены.'
+ exit 0
+fi
+kind=wg; [ "$iface" != awg0 ] || kind=awg
+printf "VPN_ROUTE_DEV='%s'\nVPN_ROUTE_GW=''\nVPN_ROUTE_MTU='1280'\n" "$iface" > /etc/routewolf/route.conf
+printf "WATCHDOG_TYPE='%s'\nWATCHDOG_DEVICE='%s'\nWATCHDOG_UCI_IFACE='%s'\nWATCHDOG_INTERVAL_MIN='30'\n" "$kind" "$iface" "$iface" > /etc/routewolf/watchdog.conf
+uci set "network.$iface.auto=1" && uci commit network || exit 1
+ifup "$iface"
+/etc/init.d/routewolf-watchdog enable
+grep -q 'routewolf-watchdog.sh check' /etc/crontabs/root || printf '*/30 * * * * /usr/sbin/routewolf-watchdog.sh check >/tmp/routewolf-watchdog.log 2>&1\n' >> /etc/crontabs/root
+/etc/init.d/cron restart
+/usr/sbin/routewolf-route.sh || { echo 'Туннель пока недоступен; проверьте конфиг. Основной WAN не изменён.'; exit 1; }
+echo 'Проверьте: rw status; rw diag. Исходный route.conf сохранён как route.conf.previous.'
