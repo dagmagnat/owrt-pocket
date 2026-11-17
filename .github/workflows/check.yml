@@ -11,3 +11,13 @@ jobs:
       - run: shellcheck -S warning -s sh src/owp install.sh
       - run: busybox ash -n src/owp && busybox ash -n install.sh
       - run: python3 -m unittest discover -s tests -v
+      - name: Build pinned upstream UCI and jsonfilter
+        run: |
+          sudo apt-get install -y cmake build-essential pkg-config libjson-c-dev
+          sh tests/build_native.sh "$RUNNER_TEMP/openwrt-native"
+      - name: Test actual UCI staging and jsonfilter paths
+        env:
+          OWP_REAL_UCI: ${{ runner.temp }}/openwrt-native/prefix/bin/uci
+          OWP_REAL_JSONFILTER: ${{ runner.temp }}/openwrt-native/prefix/bin/jsonpath
+          LD_LIBRARY_PATH: ${{ runner.temp }}/openwrt-native/prefix/lib
+        run: python3 -m unittest discover -s tests -v

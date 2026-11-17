@@ -2,7 +2,7 @@
 # owrt-pocket — MIT; OpenWrt BusyBox ash, no bash/python dependencies.
 set -u
 umask 077
-VERSION=0.1.0
+VERSION=0.2.0
 BASE=/etc/owrt-pocket
 SELF=/usr/sbin/owp
 CONFIG=/etc/config
@@ -26,6 +26,22 @@ ident() { case "$1" in ''|*[!a-zA-Z0-9_]* ) return 1;; esac; }
 devname() { case "$1" in ''|*[!a-zA-Z0-9_.-]* ) return 1;; esac; }
 mac_valid() { printf '%s\n' "$1" | grep -Eq '^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$'; }
 ipv4() { printf '%s\n' "$1" | awk -F. 'NF!=4{exit 1} {for(i=1;i<=4;i++) if($i!~/^[0-9]+$/||$i>255) exit 1}'; }
+prefix_valid() { case "$1" in ''|*[!0-9]*) return 1;; esac; [ "${#1}" -le 2 ] && [ "$1" -le 32 ]; }
+overlap() {
+ ipv4 "$1" && prefix_valid "$2" && ipv4 "$3" && prefix_valid "$4" || return 2
+ awk -v a="$1" -v p="$2" -v b="$3" -v q="$4" 'BEGIN {
+  split(a,x,"."); split(b,y,"."); u=0;v=0
+  for(i=1;i<=4;i++){u=u*256+x[i];v=v*256+y[i]}
+  size=2^(32-(p<q?p:q)); exit int(u/size)!=int(v/size)
+ }'
+}
+private_lan() {
+ ipv4 "$1" || return 1
+ printf '%s\n' "$1" | awk -F. '{exit !(($1==10 || ($1==172&&$2>=16&&$2<=31) || ($1==192&&$2==168)) && $4>=1 && $4<=254)}'
+}
+safe_text() { [ -n "$1" ] && ! printf '%s' "$1" | LC_ALL=C grep -q '[[:cntrl:]]'; }
+psk_valid() { [ "${#1}" -ge 8 ] && [ "${#1}" -le 63 ] && ! printf '%s' "$1" | LC_ALL=C grep -q '[^ -~]'; }
+row_value() { printf '%s' "$SCAN" | jsonfilter -e "@.results[$ROW].$1"; }
 sections() { uci -q show "$1" | sed -n "s/^$1\.\([^.=]*\)=$2$/\1/p"; }
 get() { uci -q get "$1" 2>/dev/null || :; }
 stage() { uci -c "$TX/stage" -P "$TX/delta" "$@"; }
@@ -98,6 +114,10 @@ worker() {
  done
  touch "$TX/applied"
  reload_all
+ if [ -f "$TX/repeater" ]; then
+  if repeater_verify; then touch "$TX/uplink-ready"
+  else rollback "$1"; return 1; fi
+ fi
  if load_tx "$1" && [ ! -d "$TX/claim" ] && [ -f "$TX/down-interface" ]; then
   read -r down < "$TX/down-interface"
   ident "$down" && ifdown "$down"
@@ -106,6 +126,9 @@ worker() {
 confirm() {
  id=$(pending_id); load_tx "$id" || { bad 'No pending change'; return 1; }
  [ -f "$TX/applied" ] || { bad 'Still applying'; return 1; }
+ if [ -f "$TX/repeater" ] && [ ! -f "$TX/uplink-ready" ]; then
+  bad "$(t 'Повторитель ещё проверяет DHCP и подсети. Подождите или прочтите owp repeater-status.' 'Repeater is checking DHCP/subnets. Wait or run owp repeater-status.')"; return 1
+ fi
  say "$(t 'Проверьте LAN, Wi-Fi и интернет. Сохранить конфигурацию?' 'Check LAN, Wi-Fi and internet. Keep this configuration?')"
  yes || return 1
  mkdir "$TX/claim" 2>/dev/null || { bad 'Rollback already started'; return 1; }
@@ -261,14 +284,16 @@ client_menu() {
  fi
 }
 wan_setup() {
- say "$(t '1 Перенести WAN-порт | 2 Настроить PPPoE на текущем WAN | 0 Назад' '1 Move WAN port | 2 Configure PPPoE on current WAN | 0 Back')"
+ say "$(t '1 Перенести WAN-порт | 2 PPPoE | 3 DHCP' '1 Move WAN port | 2 PPPoE | 3 DHCP')"
+ say "$(t '4 Интернет через Wi-Fi / повторитель' '4 Wi-Fi internet / repeater')"
+ say "$(t '5 Изменить LAN IP | 0 Назад' '5 Change LAN IP | 0 Back')"
  ask '>' || return; action=$ANSWER
- case "$action" in 1|2) :;; *) return;; esac
+ case "$action" in 1|2|3) :;; 4) repeater_setup; return;; 5) lan_setup; return;; *) return;; esac
  old=$(get network.wan.device)
  devname "$old" && [ -d "/sys/class/net/$old" ] || { bad 'Simple network.wan.device required'; return; }
- [ -z "$(sections network switch)$(sections network bridge-vlan)" ] || { bad 'swconfig / bridge VLAN: manual review required'; return; }
- case "$old" in *.*|br-*|wg*|tun*) bad 'Complex WAN device: manual review required'; return;; esac
  if [ "$action" = 1 ]; then
+  [ -z "$(sections network switch)$(sections network bridge-vlan)" ] || { bad 'swconfig / bridge VLAN: manual review required'; return; }
+  case "$old" in *.*|br-*|wg*|tun*) bad 'Complex WAN device: manual review required'; return;; esac
   say "$(t 'Только простой DSA: порт LAN будет удалён из br-lan и станет WAN.' 'Simple DSA only: selected LAN port leaves br-lan and becomes WAN.')"
   # Require DSA evidence, a single unfiltered LAN bridge and no extra references.
   [ -e "/sys/class/net/$old/dsa" ] || { bad 'DSA not detected'; return; }
@@ -296,15 +321,21 @@ wan_setup() {
   begin || return
   stage del_list "network.$bridge.ports=$port" && stage set "network.wan.device=$port" || return
   if [ "$(get network.wan6.device)" = "$old" ]; then stage set "network.wan6.device=$port" || return; fi
- else
+ elif [ "$action" = 2 ]; then
   [ "$(get network.wan.proto)" = dhcp ] || [ "$(get network.wan.proto)" = pppoe ] || { bad 'Only existing DHCP/PPPoE WAN supported'; return; }
   command -v pppd >/dev/null && find /usr/lib/pppd -name '*pppoe*' 2>/dev/null | grep -q . || { bad 'Install ppp and ppp-mod-pppoe first'; return; }
   ask 'PPPoE login:' || return; user=$ANSWER; [ -n "$user" ] || return
   secret 'PPPoE password:' || return; pass=$ANSWER; [ -n "$pass" ] || return
   say "WAN: $old -> PPPoE; firewall: existing WAN zone"
   begin || return
-  stage set network.wan.proto=pppoe && stage set "network.wan.username=$user" && stage set "network.wan.password=$pass" || return
+  stage set network.wan.proto=pppoe && stage set network.wan.auto=1 && stage set network.wan.defaultroute=1 && stage set "network.wan.username=$user" && stage set "network.wan.password=$pass" || return
+  disable_repeater || return
   unset pass ANSWER
+ else
+  [ "$(get network.wan.proto)" = dhcp ] || [ "$(get network.wan.proto)" = pppoe ] || { bad 'Only existing DHCP/PPPoE WAN supported'; return; }
+  say "$(t 'WAN получит адрес, шлюз и DNS автоматически. Удалить PPPoE-реквизиты?' 'WAN will obtain address, gateway and DNS automatically. Remove PPPoE credentials?')"
+  begin || return
+  dhcp_stage || return
  fi
  # Existing WAN zone must cover wan, with masquerading and reject/drop input.
  zone=
@@ -314,6 +345,203 @@ wan_setup() {
  [ -n "$zone" ] && [ "$(get firewall.$zone.masq)" = 1 ] || { bad 'Existing masqueraded WAN firewall zone required'; return; }
  case "$(get firewall.$zone.input)" in REJECT|DROP) :;; *) bad 'WAN input must be REJECT/DROP'; return;; esac
  apply
+}
+dhcp_stage() {
+ stage set network.wan.proto=dhcp && stage set network.wan.auto=1 &&
+ stage set network.wan.defaultroute=1 && stage set network.wan.peerdns=1 || return 1
+ for option in username password service ac demand keepalive pppd_options dns; do stage -q delete "network.wan.$option" || :; done
+ disable_repeater
+}
+disable_repeater() {
+ if [ "$(get network.owp_wwan.owp_managed)" = 1 ]; then
+  stage set network.owp_wwan.auto=0 && stage set wireless.owp_sta.disabled=1 || return 1
+  printf 'owp_wwan\n' > "$TX/down-interface"
+ fi
+}
+lan_settings() {
+ [ "$(get network.lan.proto)" = static ] && [ "$(get dhcp.lan)" = dhcp ] && [ "$(get dhcp.lan.interface)" = lan ] || { bad 'Simple static LAN with dhcp.lan required'; return 1; }
+ [ -z "$(sections dhcp host)$(get dhcp.lan.dhcp_option)" ] || { bad "$(t 'Сначала перенесите DHCP-резервации и пользовательские DHCP-опции в LuCI.' 'Migrate DHCP reservations/custom DHCP options in LuCI first.')"; return 1; }
+ stage set "network.lan.ipaddr=$LAN_ADDR" && stage set network.lan.netmask=255.255.255.0 &&
+ stage set dhcp.lan.ignore=0 && stage set dhcp.lan.start=100 && stage set dhcp.lan.limit=100
+}
+choose_lan() {
+ say "$(t 'Выберите частный адрес роутера. Новая LAN будет /24, например 192.168.50.1.' 'Choose a private router address. New LAN is /24, e.g. 192.168.50.1.')"
+ ask "$(t 'LAN IP (0 назад):' 'LAN IP (0 back):')" || return 1
+ LAN_ADDR=$ANSWER
+ private_lan "$LAN_ADDR" || { bad 'Invalid private /24 host address'; return 1; }
+ # Keep the router outside the DHCP pool [100,199].
+ octet=${LAN_ADDR##*.}
+ [ "$octet" -lt 100 ] || [ "$octet" -gt 199 ] || { bad 'Router address must be outside DHCP pool .100-.199'; return 1; }
+ for iface in $(sections network interface); do
+  case "$iface" in lan|loopback) continue;; esac
+  net=$(ubus call "network.interface.$iface" status 2>/dev/null) || continue
+  count_addr=0
+  while :; do
+   other=$(printf '%s' "$net" | jsonfilter -e "@[\"ipv4-address\"][$count_addr].address")
+   bits=$(printf '%s' "$net" | jsonfilter -e "@[\"ipv4-address\"][$count_addr].mask")
+   [ -n "$other" ] || break
+   if overlap "$LAN_ADDR" 24 "$other" "$bits"; then bad "$(t 'Пересечение с интерфейсом' 'Overlap with interface') $iface: $other/$bits"; return 1; fi
+   count_addr=$((count_addr + 1))
+  done
+ done
+ say "$(t 'После применения переподключите телефон с автоматическим DHCP. Новый SSH/LuCI адрес:' 'Reconnect your phone using automatic DHCP. New SSH/LuCI address:') $LAN_ADDR"
+}
+lan_setup() {
+ choose_lan || return
+ begin && lan_settings && apply
+}
+repeater_status() {
+ if [ -r "$BASE/repeater-result" ]; then cat "$BASE/repeater-result"; else say "$(t 'Проверок повторителя ещё нет.' 'No repeater checks yet.')"; fi
+ ubus call network.interface.owp_wwan status 2>/dev/null || :
+}
+repeater_verify() {
+ printf '%s\n' "$(t 'Проверка подключения повторителя…' 'Checking repeater connection…')" > "$BASE/repeater-result"
+ attempt=0
+ while [ "$attempt" -lt 20 ]; do
+  # The watchdog may have restored settings while netifd was reloading.
+  [ -f "$BASE/pending" ] && [ ! -d "$TX/claim" ] || return 1
+  uplink=$(ubus call network.interface.owp_wwan status 2>/dev/null) || uplink='{}'
+  upstream=$(printf '%s' "$uplink" | jsonfilter -e '@["ipv4-address"][0].address')
+  upstream_mask=$(printf '%s' "$uplink" | jsonfilter -e '@["ipv4-address"][0].mask')
+  up=$(printf '%s' "$uplink" | jsonfilter -e '@.up')
+  if [ "$up" = true ] && ipv4 "$upstream" && prefix_valid "$upstream_mask"; then
+   for iface in $(sections network interface); do
+    case "$iface" in owp_wwan|loopback) continue;; esac
+    net=$(ubus call "network.interface.$iface" status 2>/dev/null) || continue
+    count_addr=0
+    while :; do
+     other=$(printf '%s' "$net" | jsonfilter -e "@[\"ipv4-address\"][$count_addr].address")
+     bits=$(printf '%s' "$net" | jsonfilter -e "@[\"ipv4-address\"][$count_addr].mask")
+     [ -n "$other" ] || break
+     if overlap "$upstream" "$upstream_mask" "$other" "$bits"; then
+      {
+       printf '%s\n' "$(t 'КОНФЛИКТ ПОДСЕТЕЙ. Будет выполнен откат.' 'SUBNET CONFLICT. Rolling back.')"
+       printf 'Upstream: %s/%s; %s: %s/%s\n' "$upstream" "$upstream_mask" "$iface" "$other" "$bits"
+       t 'Запустите owp repeater ещё раз и выберите другой LAN IP; если конфликт с WAN — отсоедините кабель WAN.' 'Run owp repeater again and choose another LAN IP; for WAN overlap unplug the WAN cable.'
+      } > "$BASE/repeater-result"
+      return 1
+     fi
+     count_addr=$((count_addr + 1))
+    done
+   done
+   printf '%s\n' "$(t 'Повторитель получил IPv4; пересечений подсетей не найдено. Проверьте интернет и выполните owp confirm.' 'Repeater obtained IPv4; no subnet overlaps found. Check internet and run owp confirm.')" > "$BASE/repeater-result"
+   return 0
+  fi
+  attempt=$((attempt + 1)); sleep 2
+ done
+ printf '%s\n' "$(t 'Нет DHCP-адреса от основного роутера. Проверьте пароль/сигнал/поддержку AP+STA. Выполняется откат.' 'No upstream DHCP address. Check password/signal/AP+STA support. Rolling back.')" > "$BASE/repeater-result"
+ return 1
+}
+repeater_stage() {
+ # All object names are reserved for this tool; never overwrite user objects.
+ for spec in network.owp_wwan wireless.owp_sta firewall.owp_uplink firewall.owp_forward; do
+  if [ -n "$(get "$spec")" ] && [ "$(get "$spec.owp_managed")" != 1 ]; then bad "Reserved name already used: $spec"; return 1; fi
+ done
+ for n in $(sections firewall zone); do
+  if [ "$(get firewall.$n.name)" = owp_uplink ] && [ "$n" != owp_uplink ]; then bad 'Firewall zone name owp_uplink already used'; return 1; fi
+ done
+ begin || return 1
+ if [ -n "$LAN_ADDR" ]; then lan_settings || return 1; fi
+ stage set network.owp_wwan=interface &&
+ stage set network.owp_wwan.owp_managed=1 &&
+ stage set network.owp_wwan.proto=dhcp &&
+ stage set network.owp_wwan.auto=1 &&
+ stage set network.owp_wwan.metric=500 &&
+ stage set wireless.owp_sta=wifi-iface &&
+ stage set wireless.owp_sta.owp_managed=1 &&
+ stage set "wireless.owp_sta.device=$RADIO" &&
+ stage set wireless.owp_sta.mode=sta &&
+ stage set wireless.owp_sta.network=owp_wwan &&
+ stage set wireless.owp_sta.disabled=0 &&
+ stage set "wireless.owp_sta.ssid=$UP_SSID" &&
+ stage set "wireless.owp_sta.bssid=$BSSID" &&
+ stage set "wireless.owp_sta.encryption=$ENC" &&
+ stage set "wireless.owp_sta.key=$UP_KEY" &&
+ stage set "wireless.$RADIO.disabled=0" &&
+ stage set "wireless.$RADIO.channel=$CHANNEL" &&
+ stage set "wireless.$AP.disabled=0" &&
+ stage set firewall.owp_uplink=zone &&
+ stage set firewall.owp_uplink.owp_managed=1 &&
+ stage set firewall.owp_uplink.name=owp_uplink &&
+ stage set firewall.owp_uplink.network=owp_wwan &&
+ stage set firewall.owp_uplink.input=REJECT &&
+ stage set firewall.owp_uplink.output=ACCEPT &&
+ stage set firewall.owp_uplink.forward=REJECT &&
+ stage set firewall.owp_uplink.masq=1 &&
+ stage set firewall.owp_uplink.mtu_fix=1 &&
+ stage set firewall.owp_forward=forwarding &&
+ stage set firewall.owp_forward.owp_managed=1 &&
+ stage set firewall.owp_forward.src=lan &&
+ stage set firewall.owp_forward.dest=owp_uplink || return 1
+ touch "$TX/repeater"
+}
+repeater_setup() {
+ [ ! -r "$BASE/repeater-result" ] || cat "$BASE/repeater-result"
+ [ -z "$(pending_id)" ] || { bad 'Resolve pending change first'; return; }
+ [ "$(get network.lan.proto)" = static ] && [ "$(get dhcp.lan.interface)" = lan ] && [ "$(get dhcp.lan.ignore)" != 1 ] && [ -z "$(get network.lan.gateway)" ] || { bad 'Static LAN with active local DHCP and no LAN default gateway required'; return; }
+ lan_zone=
+ for n in $(sections firewall zone); do
+  [ "$(get firewall.$n.name)" = lan ] || continue
+  case " $(get firewall.$n.network) " in *' lan '*) lan_zone=$n;; esac
+ done
+ [ -n "$lan_zone" ] && [ "$(get firewall.$lan_zone.input)" = ACCEPT ] || { bad 'Existing trusted LAN firewall zone required'; return; }
+ say "$(t 'ПОВТОРИТЕЛЬ IPv4 (AP+STA/NAT). Сохранится отдельная LAN и пароль вашей точки доступа.' 'IPv4 REPEATER (AP+STA/NAT). Your separate LAN and AP password are preserved.')"
+ say "$(t 'На одном радио скорость снижается; при пропадании основной сети ваша AP тоже может пропасть. Для восстановления нужен кабель.' 'Shared-radio throughput is reduced; loss of upstream may also stop your AP. Keep Ethernet recovery access.')"
+ ubus list iwinfo 2>/dev/null | grep -qx iwinfo || { bad 'Install rpcd-mod-iwinfo for Wi-Fi scanning'; return; }
+ for RADIO in $(sections wireless wifi-device); do say "$RADIO"; done
+ ask "$(t 'Радиомодуль (0 назад):' 'Radio (0 back):')" || return; RADIO=$ANSWER
+ ident "$RADIO" && [ "$(get wireless.$RADIO)" = wifi-device ] || return
+ AP=
+ for n in $(sections wireless wifi-iface); do
+  [ "$(get wireless.$n.device)" = "$RADIO" ] || continue
+  if [ "$(get wireless.$n.mode)" = sta ] && [ "$n" != owp_sta ]; then bad 'Existing STA on this radio; review manually'; return; fi
+  if [ "$(get wireless.$n.mode)" = ap ] && [ "$(get wireless.$n.network)" = lan ]; then AP=$n; fi
+ done
+ [ -n "$AP" ] || { bad 'An existing AP on LAN is required'; return; }
+ case "$(get wireless.$AP.encryption)" in psk2|sae|sae-mixed) :;; *) bad 'Secure personal WPA2/WPA3 LAN AP required'; return;; esac
+ runtime=$(ubus call network.wireless status) || return
+ device=$(printf '%s' "$runtime" | jsonfilter -e "@.$RADIO.interfaces[0].ifname")
+ devname "$device" || { bad 'Enable this radio/AP before scanning'; return; }
+ say "$(t 'Сканирование может ненадолго прервать Wi-Fi.' 'Scanning may briefly interrupt Wi-Fi.')"
+ SCAN=$(ubus call iwinfo scan "{\"device\":\"$device\"}") || return
+ ROW=0
+ while [ "$ROW" -lt 64 ]; do
+  found=$(row_value bssid); [ -n "$found" ] || break
+  label=$(row_value ssid)
+  if safe_text "$label"; then
+   printf '%s) %s | %s | ch %s | %s dBm\n' "$((ROW + 1))" "$label" "$found" "$(row_value channel)" "$(row_value signal)"
+  fi
+  ROW=$((ROW + 1))
+ done
+ [ "$ROW" -gt 0 ] || { bad 'No networks found'; return; }
+ ask "$(t 'Номер сети (0 назад):' 'Network number (0 back):')" || return; number=$ANSWER
+ case "$number" in ''|*[!0-9]*|0) return;; esac
+ [ "${#number}" -le 2 ] && [ "$number" -ge 1 ] && [ "$number" -le "$ROW" ] || return
+ # Decimal conversion avoids shell octal arithmetic on input such as 08.
+ ROW=$(awk -v n="$number" 'BEGIN{print n-1}')
+ UP_SSID=$(row_value ssid); BSSID=$(row_value bssid); CHANNEL=$(row_value channel)
+ safe_text "$UP_SSID" && [ "$(printf '%s' "$UP_SSID" | wc -c)" -le 32 ] && mac_valid "$BSSID" || return
+ case "$CHANNEL" in ''|*[!0-9]*) return;; esac
+ [ "$CHANNEL" -ge 1 ] && [ "$CHANNEL" -le 233 ] || return
+ # Do not silently join open, WEP, WPA1 or enterprise networks.
+ auth=$(row_value 'encryption.authentication[*]')
+ versions=$(row_value 'encryption.wpa[*]')
+ if printf '%s\n' "$auth" | grep -qx psk && printf '%s\n' "$versions" | grep -qx 2; then ENC=psk2
+ elif printf '%s\n' "$auth" | grep -qx sae && printf '%s\n' "$versions" | grep -qx 3; then ENC=sae
+ else bad 'Only WPA2/WPA3 Personal uplinks are supported'; return; fi
+ secret "$(t 'Пароль основной сети:' 'Upstream Wi-Fi password:')" || return; UP_KEY=$ANSWER
+ psk_valid "$UP_KEY" || { unset UP_KEY ANSWER; bad 'Use an 8-63 ASCII passphrase'; return; }
+ LAN_ADDR=
+ say "$(t 'Текущий LAN IP:' 'Current LAN IP:') $(get network.lan.ipaddr)"
+ say "$(t '1 Сохранить LAN IP | 2 Выбрать другой LAN IP /24 | 0 Назад' '1 Keep LAN IP | 2 Choose another LAN IP /24 | 0 Back')"
+ ask '>' || { unset UP_KEY ANSWER; return; }
+ case "$ANSWER" in 1) :;; 2) choose_lan || { unset UP_KEY ANSWER; return; };; *) unset UP_KEY ANSWER; return;; esac
+ say "$(t 'Создать повторитель? При конфликте подсетей или отказе DHCP настройки вернутся автоматически.' 'Create repeater? Subnet conflict or DHCP failure will restore previous settings automatically.')"
+ say "$(t 'Отключите кабель WAN: проводной интернет имеет приоритет при обычной метрике. Сохраните кабель LAN для управления.' 'Unplug WAN: wired internet has priority at normal metrics. Keep a LAN cable for management.')"
+ if repeater_stage; then
+  unset UP_KEY ANSWER SCAN
+  apply
+ else unset UP_KEY ANSWER SCAN; fi
 }
 repair() {
  say "$(t '1 Перезапуск DNS/DHCP | 2 Переподключить WAN | 3 Остановить VPN на 120 с | 4 Интерфейсы | 0 Назад' '1 Restart DNS/DHCP | 2 Reconnect WAN | 3 Stop VPN for 120s | 4 Interfaces | 0 Back')"
@@ -384,7 +612,7 @@ demo() {
  say '4 Wi-Fi'
  say '5 Диагностика / Diagnostics'
  say '6 Исправления / Repairs'
- say '7 WAN / PPPoE'
+ say '7 Интернет / Internet'
  say '8 Пакеты / Packages'
  say '9 Настройки / Settings'
  say '0 Выход / Exit'
@@ -397,13 +625,14 @@ main() {
   printf '%s\n' "$(get system.@system[0].hostname)"
   free | awk 'NR==2{printf "RAM: %d / %d MiB\n",$3/1024,$2/1024}'
   [ -z "$(pending_id)" ] || printf '%s%s%s\n' "$Y" "$(t 'ОЖИДАЕТ ПОДТВЕРЖДЕНИЯ: owp confirm' 'PENDING: owp confirm')" "$Z"
+  [ ! -r "$BASE/repeater-result" ] || cat "$BASE/repeater-result"
   t '1 Состояние роутера' '1 Router status'
   t '2 Клиенты и привязки IP' '2 Clients and IP reservations'
   t '3 Интерфейсы и трафик' '3 Interfaces and traffic'
   printf '4 Wi-Fi\n'
   t '5 Диагностика сети' '5 Network diagnostics'
   t '6 Исправления и VPN' '6 Repairs and VPN'
-  printf '7 WAN / PPPoE\n'
+  t '7 Интернет / повторитель / LAN IP' '7 Internet / repeater / LAN IP'
   t '8 Пакеты' '8 Packages'
   t '9 Настройки и подтверждение' '9 Settings and confirmation'
   t '0 Выход' '0 Exit'
@@ -446,6 +675,7 @@ esac
 case "${1:-}" in
  confirm) confirm; exit;;
  rollback) yes && rollback "$(pending_id)"; exit;;
+ repeater-status) repeater_status; exit;;
 esac
 # One foreground session; recover lock after a disconnected terminal.
 LOCK=/var/lock/owrt-pocket
@@ -461,5 +691,6 @@ trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
 case "${1:-}" in
  '') main;; status) status;; clients) clients;; interfaces) interfaces;; doctor) doctor;; scan) lan_scan;;
- *) printf 'owp [status|clients|interfaces|doctor|scan|confirm|rollback|demo|--version]\n'; exit 1;;
+ internet) wan_setup;; repeater) repeater_setup;; repeater-status) repeater_status;; lan) lan_setup;;
+ *) printf 'owp [status|clients|interfaces|doctor|scan|internet|repeater|repeater-status|lan|confirm|rollback|demo|--version]\n'; exit 1;;
 esac

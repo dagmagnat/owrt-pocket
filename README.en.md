@@ -1,6 +1,6 @@
 # OWRT Pocket
 
-A colourful SSH terminal companion for OpenWrt. **0.1.0 is an experimental first version; use a spare router for hardware validation.** Russian and English menus, remembered language, `0` back, case-sensitive `Yes` for changes.
+A colourful SSH terminal companion for OpenWrt. **0.2.0 is experimental; use a spare router for hardware validation.** Russian and English menus, remembered language, `0` back, case-sensitive `Yes` for changes.
 
 Requires OpenWrt `/bin/sh`, UCI, ubus, jsonfilter, ip and nohup. No Python, Bash or cloud service is needed on the router. Target versions are OpenWrt 24.10/25.12; real hardware has not yet been validated.
 
@@ -30,3 +30,43 @@ Backups contain plaintext Wi-Fi/PPPoE secrets, as normal UCI does; they are root
 Lease counts are not online-client counts; bitrate is not an internet speed test. ICMP failure is not proof of an outage. Root renaming, arbitrary new networks, full VLAN setup and unsupported interface shutdowns are outside this version. Detailed output scrolls in the terminal.
 
 See [Russian documentation](README.md) and the [hardware test plan](TESTING.md) for full limitations and recovery steps. Host tests use mocked router commands and do not establish hardware compatibility. MIT licensed.
+
+## Internet and repeater wizard in 0.2.0
+
+`owp internet` (menu 7) adds wired DHCP/PPPoE switching, `owp repeater`, and `owp lan`.
+Switching back to DHCP removes PPPoE credentials and obtains DNS automatically.
+DHCP/PPPoE use the existing WAN device, including existing swconfig VLAN devices;
+the DSA-only restriction applies to moving the physical WAN port.
+
+The repeater is **IPv4 routed AP+STA/NAT with a separate LAN**, not 802.11s mesh,
+WDS, an L2 bridge or seamless roaming. It scans using `rpcd-mod-iwinfo`, lets you
+select a visible WPA2/WPA3 Personal AP, accepts a hidden passphrase, preserves
+your existing secure LAN AP, and creates a restricted masqueraded uplink zone.
+An existing active LAN DHCP server is required. BSSID and channel are pinned.
+Open/WEP/WPA1/enterprise/hidden networks are refused. Passphrases are limited to
+8–63 printable ASCII characters.
+
+Keep LAN IP or explicitly choose a private `/24` router address outside the
+new DHCP pool `.100`–`.199`. Custom DHCP options/reservations must be migrated
+manually before a LAN change. Reconnect your phone with automatic DHCP after
+changing LAN; SSH/LuCI move to the new local IP. Static clients need manual
+address/gateway changes.
+
+After applying, the detached worker waits up to about 40 seconds for upstream
+DHCP and checks all IPv4 addresses of the other configured interfaces for subnet
+overlap, including non-/24 masks. DHCP failure or overlap restores the old config.
+`owp repeater-status` explains the result. Run the wizard again with a different
+LAN IP after a conflict. The subnet is only known after association and DHCP.
+Confirmation is blocked until these checks pass; manually check internet, then
+run `owp confirm` and type `Yes` within the overall 120-second rollback window.
+
+Wired WAN remains enabled and has priority at normal metrics (Wi-Fi uplink metric
+500). Disconnect WAN while testing Wi-Fi internet, but keep LAN recovery access.
+Returning to wired DHCP/PPPoE disables only this tool's STA/WWAN. Existing policy
+routing/RouteWolf rules are preserved and need separate validation. IPv6 uplink
+is not configured. Shared-radio airtime reduces throughput; losing the upstream
+AP can also stop the local AP. A driver that cannot do AP+STA needs another mode
+or hardware. There is no additional permanent watchdog daemon.
+
+CI builds pinned upstream UCI/jsonfilter tools for real staging and JSON-path
+tests, in addition to mocked network tests. Hardware has not been validated.
