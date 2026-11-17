@@ -1,0 +1,13 @@
+name: Shell and safety checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  safety:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck busybox
+      - run: shellcheck -S warning -s sh src/owp install.sh
+      - run: busybox ash -n src/owp && busybox ash -n install.sh
+      - run: python3 -m unittest discover -s tests -v

@@ -1,0 +1,465 @@
+#!/bin/sh
+# owrt-pocket — MIT; OpenWrt BusyBox ash, no bash/python dependencies.
+set -u
+umask 077
+VERSION=0.1.0
+BASE=/etc/owrt-pocket
+SELF=/usr/sbin/owp
+CONFIG=/etc/config
+TX=
+LANGUAGE=ru
+[ ! -r "$BASE/language" ] || read -r LANGUAGE < "$BASE/language"
+R='' G='' Y='' B='' D='' Z=''
+if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ] && [ -z "${NO_COLOR:-}" ]; then
+ R=$(printf '\033[91m'); G=$(printf '\033[92m'); Y=$(printf '\033[93m')
+ B=$(printf '\033[96m'); D=$(printf '\033[1m'); Z=$(printf '\033[0m')
+fi
+t() { if [ "$LANGUAGE" = en ]; then printf '%s\n' "$2"; else printf '%s\n' "$1"; fi; }
+say() { printf '%s%s%s\n' "$B" "$*" "$Z"; }
+bad() { printf '%s%s%s\n' "$R" "$*" "$Z" >&2; }
+ok() { printf '%s%s%s\n' "$G" "$*" "$Z"; }
+ask() { printf '%s ' "$*"; IFS= read -r ANSWER || return 1; }
+yes() { ask "$(t 'Для применения введите Yes:' 'Type Yes to apply:')" && [ "$ANSWER" = Yes ]; }
+pause() { ask "$(t 'Enter — назад' 'Enter — back')" || :; }
+need_root() { [ "$(id -u)" = 0 ] || { bad 'root required'; exit 1; }; }
+ident() { case "$1" in ''|*[!a-zA-Z0-9_]* ) return 1;; esac; }
+devname() { case "$1" in ''|*[!a-zA-Z0-9_.-]* ) return 1;; esac; }
+mac_valid() { printf '%s\n' "$1" | grep -Eq '^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$'; }
+ipv4() { printf '%s\n' "$1" | awk -F. 'NF!=4{exit 1} {for(i=1;i<=4;i++) if($i!~/^[0-9]+$/||$i>255) exit 1}'; }
+sections() { uci -q show "$1" | sed -n "s/^$1\.\([^.=]*\)=$2$/\1/p"; }
+get() { uci -q get "$1" 2>/dev/null || :; }
+stage() { uci -c "$TX/stage" -P "$TX/delta" "$@"; }
+pending_id() { [ -r "$BASE/pending" ] && cat "$BASE/pending"; }
+load_tx() {
+ id=${1:-}; case "$id" in ''|*[!0-9_]* ) return 1;; esac
+ TX=$BASE/transactions/$id
+ [ -d "$TX/original" ] && [ "$(pending_id)" = "$id" ]
+}
+reload_all() {
+ /etc/init.d/network reload
+ wifi reload
+ /etc/init.d/dnsmasq restart
+ /etc/init.d/firewall reload
+}
+restore_files() {
+ for f in network wireless dhcp firewall; do
+  if [ -f "$TX/original/$f" ]; then cp -p "$TX/original/$f" "$CONFIG/$f" || return 1
+  elif [ -f "$TX/absent-$f" ]; then rm -f "$CONFIG/$f"; fi
+ done
+}
+rollback() {
+ load_tx "$1" || return 1
+ if [ "${2:-}" = boot ] && [ "$(cat "$TX/result" 2>/dev/null)" != confirmed ]; then rmdir "$TX/claim" 2>/dev/null || :; fi
+ mkdir "$TX/claim" 2>/dev/null || return 1
+ if restore_files; then
+  printf 'rolled-back\n' > "$TX/result"
+  rm -f "$BASE/pending"
+  [ "${2:-}" = boot ] || reload_all
+ else
+  rmdir "$TX/claim"
+  return 1
+ fi
+}
+begin() {
+ if [ -n "$(pending_id)" ]; then bad "$(t 'Сначала подтвердите или откатите предыдущее изменение.' 'Confirm or roll back the pending change first.')"; return 1; fi
+ # Never overwrite another administrator's uncommitted UCI work.
+ for f in network wireless dhcp firewall; do
+  if [ -n "$(uci -q changes "$f")" ]; then bad "Uncommitted UCI: $f"; return 1; fi
+ done
+ count=$(find "$BASE/transactions" -mindepth 1 -maxdepth 1 -type d | wc -l)
+ [ "$count" -lt 20 ] || { bad '20 backups retained. Archive/delete old transaction directories before continuing.'; return 1; }
+ TX=$BASE/transactions/$(date +%s)_$$
+ mkdir -p "$TX/original" "$TX/stage" "$TX/delta" || return 1
+ for f in network wireless dhcp firewall; do
+  if [ -f "$CONFIG/$f" ]; then
+   cp -p "$CONFIG/$f" "$TX/original/$f" && cp -p "$CONFIG/$f" "$TX/stage/$f" || return 1
+  else touch "$TX/absent-$f" "$TX/stage/$f"; fi
+ done
+}
+apply() {
+ for f in network wireless dhcp firewall; do stage commit "$f" || return 1; done
+ for f in network wireless dhcp firewall; do
+  if [ -f "$TX/original/$f" ]; then cmp -s "$TX/original/$f" "$CONFIG/$f" || { bad 'Configuration changed externally; retry'; return 1; }
+  elif [ -e "$CONFIG/$f" ]; then bad 'Configuration changed externally; retry'; return 1; fi
+ done
+ say "$(t 'Изменение будет отменено через 120 с. Для сохранения: owp confirm' 'Rollback in 120s. To keep the change: owp confirm')"
+ yes || return 1
+ id=${TX##*/}
+ printf '%s\n' "$id" > "$BASE/pending"
+ nohup "$SELF" _apply "$id" </dev/null >"$TX/apply.log" 2>&1 &
+ say "$(t 'Применение запущено. При потере SSH подключитесь снова.' 'Applying. Reconnect if SSH disconnects.')"
+}
+worker() {
+ load_tx "$1" || exit 1
+ nohup "$SELF" _watch "$1" </dev/null >"$TX/watch.log" 2>&1 &
+ sleep 2
+ for f in network wireless dhcp firewall; do
+  cp -p "$TX/stage/$f" "$CONFIG/$f" || { rollback "$1"; exit 1; }
+ done
+ touch "$TX/applied"
+ reload_all
+ if load_tx "$1" && [ ! -d "$TX/claim" ] && [ -f "$TX/down-interface" ]; then
+  read -r down < "$TX/down-interface"
+  ident "$down" && ifdown "$down"
+ fi
+}
+confirm() {
+ id=$(pending_id); load_tx "$id" || { bad 'No pending change'; return 1; }
+ [ -f "$TX/applied" ] || { bad 'Still applying'; return 1; }
+ say "$(t 'Проверьте LAN, Wi-Fi и интернет. Сохранить конфигурацию?' 'Check LAN, Wi-Fi and internet. Keep this configuration?')"
+ yes || return 1
+ mkdir "$TX/claim" 2>/dev/null || { bad 'Rollback already started'; return 1; }
+ printf 'confirmed\n' > "$TX/result"
+ rm -f "$BASE/pending"
+ ok "$(t 'Сохранено' 'Saved')"
+}
+status() {
+ say "$(t 'СОСТОЯНИЕ РОУТЕРА' 'ROUTER STATUS')"
+ ubus call system board
+ uptime
+ free -m
+ df -h /overlay /tmp 2>/dev/null
+ say "$(t 'Адреса и маршруты' 'Addresses and routes')"
+ ip -4 addr show
+ ip -4 route show
+ ip -6 route show default
+ say "$(t 'Wi-Fi: фактическое состояние' 'Wi-Fi: runtime status')"
+ ubus call network.wireless status | jsonfilter -e '@.*.up' | while read -r state; do
+  if [ "$state" = true ]; then ok "$(t 'ВКЛЮЧЁН: ДА' 'ENABLED: YES')"; else bad "$(t 'ВКЛЮЧЁН: НЕТ' 'ENABLED: NO')"; fi
+ done
+}
+interfaces() {
+ for n in $(sections network interface); do
+  say "$n  [$(get network.$n.proto)]  $(get network.$n.device)"
+  data=$(ubus call "network.interface.$n" status 2>/dev/null) || continue
+  up=$(printf '%s' "$data" | jsonfilter -e '@.up')
+  if [ "$up" = true ]; then ok "$(t 'Подключён: ДА' 'Connected: YES')"; else bad "$(t 'Подключён: НЕТ' 'Connected: NO')"; fi
+  printf '%s' "$data" | jsonfilter -e '@["ipv4-address"][*].address' -e '@["ipv6-address"][*].address'
+ done
+ say "$(t 'Счётчики RX/TX (байты, не скорость)' 'RX/TX counters (bytes, not speed)')"
+ ip -s link
+}
+clients() {
+ say "$(t 'DHCP-аренды (не доказательство присутствия)' 'DHCP leases (not proof of presence)')"
+ [ ! -r /tmp/dhcp.leases ] || awk '{print $2, $3, $4}' /tmp/dhcp.leases
+ say "$(t 'Соседи LAN' 'LAN neighbours')"; ip neigh show
+ for obj in $(ubus list 'hostapd.*'); do
+  say "$obj"; ubus call "$obj" get_clients
+ done
+ if command -v iw >/dev/null; then
+  iw dev | awk '$1=="Interface"{print $2}' | while read -r dev; do
+   say "$dev"; iw dev "$dev" station dump
+  done
+ fi
+}
+doctor() {
+ say "$(t 'ДИАГНОСТИКА — без изменения настроек' 'DIAGNOSTICS — read only')"
+ say "$(t 'LAN и физические порты' 'LAN and physical links')"
+ ip -br addr 2>/dev/null || ip addr
+ for path in /sys/class/net/*; do
+  [ -e "$path/device" ] || [ -e "$path/phys_port_name" ] || continue
+  printf '%s: ' "${path##*/}"; cat "$path/carrier" 2>/dev/null || :
+ done
+ if ip -4 route show default | grep -q .; then ok 'IPv4 default route: YES'; else bad 'IPv4 default route: NO'; fi
+ gateway=$(ip -4 route show default | awk '/via/{print $3;exit}')
+ if [ -n "$gateway" ]; then
+  if ping -c 2 -W 2 "$gateway" >/dev/null 2>&1; then ok 'Gateway ICMP: YES'; else bad 'Gateway ICMP: NO / filtered'; fi
+ fi
+ INTERNET=0
+ for target in 1.1.1.1 9.9.9.9; do
+  if ping -c 2 -W 2 "$target" >/dev/null 2>&1; then ok "$target ICMP: YES"; INTERNET=1; else bad "$target ICMP: NO / filtered"; fi
+ done
+ if nslookup openwrt.org 127.0.0.1 >/dev/null 2>&1; then ok 'Local DNS: YES'; else bad 'Local DNS: NO'; fi
+ say "$(t 'VPN/туннели и policy routing' 'VPN/tunnels and policy routing')"
+ for n in $(sections network interface); do
+  case "$(get network.$n.proto)" in wireguard|openvpn|tun|pptp|l2tp) say "$n: $(get network.$n.proto)";; esac
+ done
+ ip rule show; ip -4 route show table all
+ for svc in openvpn pbr mwan3 sing-box xray tailscale; do
+  [ ! -x "/etc/init.d/$svc" ] || { printf '%s: ' "$svc"; /etc/init.d/"$svc" status 2>/dev/null || :; }
+ done
+ say "$(t 'Последние сетевые сообщения (могут содержать адреса)' 'Recent network logs (may contain addresses)')"
+ logread | grep -Ei 'netifd|dnsmasq|wan|wireguard|openvpn' | tail -n 25
+ if [ "$INTERNET" = 0 ]; then
+  say "$(t 'Проверьте кабель/PPPoE, DNS и VPN. ICMP может блокироваться — это не доказательство отсутствия интернета.' 'Check cable/PPPoE, DNS and VPN. ICMP may be filtered; failure does not prove internet is down.')"
+ fi
+ say "$(t 'Исправления: меню 6 — DNS/DHCP, WAN reconnect или временная остановка VPN. Выбирайте по результатам.' 'Repairs: menu 6 — DNS/DHCP, WAN reconnect or temporary VPN stop. Choose based on the findings.')"
+}
+lan_scan() {
+ data=$(ubus call network.interface.lan status) || return
+ addr=$(printf '%s' "$data" | jsonfilter -e '@["ipv4-address"][0].address')
+ mask=$(printf '%s' "$data" | jsonfilter -e '@["ipv4-address"][0].mask')
+ ipv4 "$addr" && [ "$mask" = 24 ] || { bad 'Active scan currently supports IPv4 LAN /24 only'; return; }
+ prefix=${addr%.*}
+ say "$(t 'Проверка ICMP до 32 адресов своей LAN. Спящие устройства и фильтры могут не отвечать.' 'ICMP scan of up to 32 addresses on your LAN. Sleeping devices and filters may not reply.')"
+ ask "$prefix.X — $(t 'начальный X (1–254; 0 назад):' 'first X (1–254; 0 back):')" || return
+ start=$ANSWER
+ case "$start" in ''|*[!0-9]*|0) return;; esac
+ [ "${#start}" -le 3 ] && [ "$start" -ge 1 ] && [ "$start" -le 254 ] || return
+ finish=$((start + 31)); [ "$finish" -le 254 ] || finish=254
+ say "$prefix.$start — $prefix.$finish (~32s)"
+ yes || return
+ i=$start
+ while [ "$i" -le "$finish" ]; do
+  if ping -c 1 -W 1 "$prefix.$i" >/dev/null 2>&1; then ok "$prefix.$i"; fi
+  i=$((i + 1))
+ done
+ ip neigh show
+}
+wifi_menu() {
+ say '1 Wi-Fi ON | 2 Wi-Fi OFF | 3 SSID / password | 0'
+ ask '>' || return
+ case "$ANSWER" in
+  1|2)
+   choice=$ANSWER; begin || return
+   for n in $(sections wireless wifi-device); do stage set "wireless.$n.disabled=$((choice - 1))" || return; done
+   say "$(t 'Wi-Fi изменится. SSH по Wi-Fi может оборваться.' 'Wi-Fi changes may disconnect SSH.')"; apply;;
+  3)
+   for n in $(sections wireless wifi-iface); do say "$n: $(get wireless.$n.ssid) [$(get wireless.$n.encryption)]"; done
+   ask "$(t 'Секция Wi-Fi (0 назад):' 'Wi-Fi section (0 back):')" || return; n=$ANSWER
+   [ "$n" != 0 ] || return
+   [ "$(get wireless.$n)" = wifi-iface ] && [ "$(get wireless.$n.mode)" = ap ] || return
+   case "$(get wireless.$n.encryption)" in psk2|sae|sae-mixed) :;; *) bad 'Only personal WPA2/WPA3 AP supported'; return;; esac
+   ask 'SSID:' || return; ssid=$ANSWER
+   [ -n "$ssid" ] && [ "$(printf '%s' "$ssid" | wc -c)" -le 32 ] || return
+   secret "$(t 'Новый пароль (8–63 ASCII):' 'New password (8–63 ASCII):')" || return; key=$ANSWER
+   [ "${#key}" -ge 8 ] && [ "${#key}" -le 63 ] && ! printf '%s' "$key" | LC_ALL=C grep -q '[^ -~]' || return
+   begin || return
+   stage set "wireless.$n.ssid=$ssid" && stage set "wireless.$n.key=$key" || return
+   unset key ANSWER; apply;;
+ esac
+}
+secret() {
+ printf '%s ' "$1"; stty -echo || return 1
+ IFS= read -r ANSWER; rc=$?
+ stty echo; printf '\n'; return "$rc"
+}
+client_menu() {
+ clients
+ say "$(t '1 Привязать IPv4 к MAC | 2 Отключить Wi-Fi клиента на 60 с | 0 Назад' '1 Reserve IPv4 for MAC | 2 Disconnect Wi-Fi client for 60s | 0 Back')"
+ ask '>' || return; action=$ANSWER
+ case "$action" in 1|2) :;; *) return;; esac
+ ask 'MAC:' || return; mac=$ANSWER; mac_valid "$mac" || return
+ if [ "$action" = 1 ]; then
+  ask 'IPv4:' || return; addr=$ANSWER; ipv4 "$addr" || return
+  # Require an existing LAN lease; refuse arbitrary addresses/subnets/conflicts.
+  awk -v m="$mac" -v a="$addr" 'tolower($2)==tolower(m)&&$3==a{found=1} END{exit !found}' /tmp/dhcp.leases || { bad 'Use the current DHCP lease address for this MAC'; return; }
+  for n in $(sections dhcp host); do
+   if [ "$(get dhcp.$n.ip)" = "$addr" ] || printf '%s' "$(get dhcp.$n.mac)" | grep -qiF "$mac"; then bad 'Reservation already exists; review in LuCI'; return; fi
+  done
+  begin || return
+  n=$(stage add dhcp host) || return
+  stage set "dhcp.$n.mac=$mac" && stage set "dhcp.$n.ip=$addr" || return
+  apply
+ else
+  ubus list 'hostapd.*'
+  ask 'hostapd object:' || return; obj=$ANSWER
+  ubus list 'hostapd.*' | grep -qxF "$obj" || return
+  say "$(t 'Возможно отключение вашего телефона. Автооткат конфигурации здесь не нужен: бан на 60 с.' 'Your phone may disconnect. This is a temporary 60s ban.')"
+  yes || return
+  ubus call "$obj" del_client "{\"addr\":\"$mac\",\"reason\":5,\"deauth\":true,\"ban_time\":60000}"
+ fi
+}
+wan_setup() {
+ say "$(t '1 Перенести WAN-порт | 2 Настроить PPPoE на текущем WAN | 0 Назад' '1 Move WAN port | 2 Configure PPPoE on current WAN | 0 Back')"
+ ask '>' || return; action=$ANSWER
+ case "$action" in 1|2) :;; *) return;; esac
+ old=$(get network.wan.device)
+ devname "$old" && [ -d "/sys/class/net/$old" ] || { bad 'Simple network.wan.device required'; return; }
+ [ -z "$(sections network switch)$(sections network bridge-vlan)" ] || { bad 'swconfig / bridge VLAN: manual review required'; return; }
+ case "$old" in *.*|br-*|wg*|tun*) bad 'Complex WAN device: manual review required'; return;; esac
+ if [ "$action" = 1 ]; then
+  say "$(t 'Только простой DSA: порт LAN будет удалён из br-lan и станет WAN.' 'Simple DSA only: selected LAN port leaves br-lan and becomes WAN.')"
+  # Require DSA evidence, a single unfiltered LAN bridge and no extra references.
+  [ -e "/sys/class/net/$old/dsa" ] || { bad 'DSA not detected'; return; }
+  bridge=
+  for n in $(sections network device); do
+   if [ "$(get network.$n.name)" = br-lan ] && [ "$(get network.$n.type)" = bridge ]; then bridge=$n; fi
+  done
+  [ -n "$bridge" ] && [ "$(get network.lan.device)" = br-lan ] && [ "$(get network.$bridge.vlan_filtering)" != 1 ] || { bad 'Simple br-lan required'; return; }
+  ports=$(get network.$bridge.ports); say "$ports"
+  ask "$(t 'Новый WAN-порт (0 назад):' 'New WAN port (0 back):')" || return; port=$ANSWER
+  devname "$port" && [ -e "/sys/class/net/$port/dsa" ] || return
+  case " $ports " in *" $port "*) :;; *) return;; esac
+  [ "$(printf '%s\n' "$ports" | wc -w)" -ge 2 ] || { bad 'At least one LAN port must remain'; return; }
+  for n in $(sections network interface); do
+   case "$(get network.$n.device)" in "$port"|"$port."*) bad 'Port already referenced'; return;; esac
+  done
+  for n in $(sections network device); do
+   [ "$n" = "$bridge" ] && continue
+   case " $(get network.$n.ports) " in *" $port "*) bad 'Port belongs to another bridge'; return;; esac
+   [ "$(get network.$n.ifname)" != "$port" ] || { bad 'Port is referenced by another device'; return; }
+  done
+  [ -z "$(get network.wan6.device)" ] || [ "$(get network.wan6.device)" = '@wan' ] || [ "$(get network.wan6.device)" = "$old" ] || { bad 'Complex WAN6'; return; }
+  say "$old -> $port; LAN: $ports -> remove $port"
+  say "$(t 'После применения переставьте кабель провайдера. Порт станет внешним WAN с действующими правилами firewall.' 'Move the ISP cable after applying. Port becomes external WAN under existing firewall rules.')"
+  begin || return
+  stage del_list "network.$bridge.ports=$port" && stage set "network.wan.device=$port" || return
+  if [ "$(get network.wan6.device)" = "$old" ]; then stage set "network.wan6.device=$port" || return; fi
+ else
+  [ "$(get network.wan.proto)" = dhcp ] || [ "$(get network.wan.proto)" = pppoe ] || { bad 'Only existing DHCP/PPPoE WAN supported'; return; }
+  command -v pppd >/dev/null && find /usr/lib/pppd -name '*pppoe*' 2>/dev/null | grep -q . || { bad 'Install ppp and ppp-mod-pppoe first'; return; }
+  ask 'PPPoE login:' || return; user=$ANSWER; [ -n "$user" ] || return
+  secret 'PPPoE password:' || return; pass=$ANSWER; [ -n "$pass" ] || return
+  say "WAN: $old -> PPPoE; firewall: existing WAN zone"
+  begin || return
+  stage set network.wan.proto=pppoe && stage set "network.wan.username=$user" && stage set "network.wan.password=$pass" || return
+  unset pass ANSWER
+ fi
+ # Existing WAN zone must cover wan, with masquerading and reject/drop input.
+ zone=
+ for n in $(sections firewall zone); do
+  case " $(get firewall.$n.network) " in *' wan '*) zone=$n;; esac
+ done
+ [ -n "$zone" ] && [ "$(get firewall.$zone.masq)" = 1 ] || { bad 'Existing masqueraded WAN firewall zone required'; return; }
+ case "$(get firewall.$zone.input)" in REJECT|DROP) :;; *) bad 'WAN input must be REJECT/DROP'; return;; esac
+ apply
+}
+repair() {
+ say "$(t '1 Перезапуск DNS/DHCP | 2 Переподключить WAN | 3 Остановить VPN на 120 с | 4 Интерфейсы | 0 Назад' '1 Restart DNS/DHCP | 2 Reconnect WAN | 3 Stop VPN for 120s | 4 Interfaces | 0 Back')"
+ ask '>' || return
+ case "$ANSWER" in
+  1) yes && /etc/init.d/dnsmasq restart;;
+  2) say "$(t 'Интернет временно отключится.' 'Internet will temporarily disconnect.')"; yes && ubus call network.interface.wan renew;;
+  3)
+   for svc in openvpn sing-box xray tailscale; do [ ! -x "/etc/init.d/$svc" ] || say "$svc"; done
+   ask 'Service (0 back):' || return; svc=$ANSWER
+   case "$svc" in openvpn|sing-box|xray|tailscale) :;; *) return;; esac
+   [ -x "/etc/init.d/$svc" ] && /etc/init.d/"$svc" running || { bad 'Service not running'; return; }
+   yes || return
+   nohup "$SELF" _vpn "$svc" </dev/null >"$BASE/vpn.log" 2>&1 &;;
+  4)
+   interfaces
+   ask "$(t 'Имя VPN/интерфейса (0 назад):' 'VPN/interface name (0 back):')" || return; n=$ANSWER
+   ident "$n" && [ "$(get network.$n)" = interface ] || return
+   # Only tunnel protocols: LAN/WAN and access networks cannot be disabled here.
+   case "$n" in wan|wan6|lan|loopback) return;; esac
+   case "$(get network.$n.proto)" in wireguard|pptp|l2tp) :;; *) bad 'Only dedicated VPN tunnels supported'; return;; esac
+   say "$(t '1 Включить при загрузке | 2 Отключить | 0 Назад' '1 Enable on boot | 2 Disable | 0 Back')"
+   ask '>' || return
+   case "$ANSWER" in 1) auto=1;; 2) auto=0;; *) return;; esac
+   begin || return; stage set "network.$n.auto=$auto" || return
+   if [ "$auto" = 0 ]; then printf '%s\n' "$n" > "$TX/down-interface"; fi
+   apply;;
+ esac
+}
+packages() {
+ if command -v apk >/dev/null; then pm=apk; elif command -v opkg >/dev/null; then pm=opkg; else bad 'No package manager'; return; fi
+ say "1 $(t 'Установленные пакеты' 'Installed packages')"
+ say "2 $(t 'Установить пакет' 'Install package') | 3 $(t 'Сервисы' 'Services') | 0"
+ ask '>' || return
+ case "$ANSWER" in
+  1) if [ "$pm" = apk ]; then apk info; else opkg list-installed; fi;;
+  3) for path in /etc/init.d/*; do
+      [ -x "$path" ] || continue
+      printf '%s: ' "${path##*/}"
+      if "$path" running >/dev/null 2>&1; then ok "$(t 'РАБОТАЕТ' 'RUNNING')"; else printf '%s\n' "$(t 'не запущен / статус неизвестен' 'stopped / status unknown')"; fi
+     done;;
+  2) ask 'Package:' || return; pkg=$ANSWER
+   case "$pkg" in ''|-*|*[!a-zA-Z0-9+_.-]*) return;; esac
+   df -h /overlay
+   say "$(t 'Установка из настроенных репозиториев. Автоматического отката пакетов нет.' 'Install from configured repositories. Package changes have no automatic rollback.')"
+   yes || return
+   "$pm" update || return
+   if [ "$pm" = apk ]; then apk add "$pkg"; else opkg install "$pkg"; fi;;
+ esac
+}
+language() {
+ say '1 Русский | 2 English | 0'
+ ask '>' || return
+ case "$ANSWER" in 1) LANGUAGE=ru;; 2) LANGUAGE=en;; *) return;; esac
+ printf '%s\n' "$LANGUAGE" > "$BASE/language"
+}
+demo() {
+ printf '%s%s┌──────────────────────────────┐%s\n' "$B" "$D" "$Z"
+ say '│  OWRT POCKET / DEMO           │'
+ say '└──────────────────────────────┘'
+ ok 'Wi-Fi: ВКЛЮЧЁН / ENABLED'
+ ok 'WAN: ПОДКЛЮЧЁН / CONNECTED'
+ bad 'VPN: ОТКЛЮЧЁН / DISABLED'
+ printf 'LAN   192.168.1.1\nRAM   68 / 256 MiB\nWi-Fi clients   3\n'
+ say '1 Состояние / Status'
+ say '2 Клиенты / Clients'
+ say '3 Интерфейсы / Interfaces'
+ say '4 Wi-Fi'
+ say '5 Диагностика / Diagnostics'
+ say '6 Исправления / Repairs'
+ say '7 WAN / PPPoE'
+ say '8 Пакеты / Packages'
+ say '9 Настройки / Settings'
+ say '0 Выход / Exit'
+ printf '\nDEMO: synthetic data; no router commands executed.\n'
+}
+main() {
+ [ -r "$BASE/language" ] || language
+ while :; do
+  say "━━ OWRT POCKET $VERSION ━━"
+  printf '%s\n' "$(get system.@system[0].hostname)"
+  free | awk 'NR==2{printf "RAM: %d / %d MiB\n",$3/1024,$2/1024}'
+  [ -z "$(pending_id)" ] || printf '%s%s%s\n' "$Y" "$(t 'ОЖИДАЕТ ПОДТВЕРЖДЕНИЯ: owp confirm' 'PENDING: owp confirm')" "$Z"
+  t '1 Состояние роутера' '1 Router status'
+  t '2 Клиенты и привязки IP' '2 Clients and IP reservations'
+  t '3 Интерфейсы и трафик' '3 Interfaces and traffic'
+  printf '4 Wi-Fi\n'
+  t '5 Диагностика сети' '5 Network diagnostics'
+  t '6 Исправления и VPN' '6 Repairs and VPN'
+  printf '7 WAN / PPPoE\n'
+  t '8 Пакеты' '8 Packages'
+  t '9 Настройки и подтверждение' '9 Settings and confirmation'
+  t '0 Выход' '0 Exit'
+  ask '>' || break
+  case "$ANSWER" in
+   1) status;; 2) client_menu;; 3) interfaces;; 4) wifi_menu;;
+   5) doctor; say "$(t '1 Сканировать LAN | 0 Назад' '1 Scan LAN | 0 Back')"; ask '>' && [ "$ANSWER" = 1 ] && lan_scan;;
+   6) repair;; 7) wan_setup;; 8) packages;;
+   9)
+    say "$(t '1 Язык | 2 Пароль root | 3 Подтвердить | 4 Откатить | 0 Назад' '1 Language | 2 Root password | 3 Confirm | 4 Roll back | 0 Back')"
+    ask '>' || break
+    case "$ANSWER" in 1) language;; 2) say "$(t 'Пароль не откатывается автоматически.' 'Password changes have no automatic rollback.')"; yes && passwd root;; 3) confirm;; 4) yes && rollback "$(pending_id)";; esac;;
+   0) break;; *) continue;;
+  esac
+  pause
+ done
+}
+if [ "${OWP_SOURCE_ONLY:-0}" = 1 ]; then return 0; fi
+case "${1:-}" in demo|--demo) demo; exit;; --version) printf '%s\n' "$VERSION"; exit;; esac
+need_root
+[ -f /etc/openwrt_release ] || { bad 'OpenWrt required (try: owp demo)'; exit 1; }
+mkdir -p "$BASE/transactions"
+case "${1:-}" in
+ _apply) worker "${2:-}"; exit;;
+ _watch) sleep 120; rollback "${2:-}"; exit;;
+ _boot)
+  id=$(pending_id)
+  if [ -n "$id" ] && load_tx "$id"; then
+   if [ "$(cat "$TX/result" 2>/dev/null)" = confirmed ]; then rm -f "$BASE/pending"; else rollback "$id" boot; fi
+  fi
+  exit;;
+ _vpn)
+  case "${2:-}" in openvpn|sing-box|xray|tailscale) :;; *) exit 1;; esac
+  # Start recovery timer before stopping; survives a dropped SSH session.
+  (sleep 120; /etc/init.d/"$2" start) &
+  /etc/init.d/"$2" stop; wait; exit;;
+esac
+# Confirmation and rollback use the transaction's atomic claim, and must also
+# work from a second SSH session while the original menu is still open.
+case "${1:-}" in
+ confirm) confirm; exit;;
+ rollback) yes && rollback "$(pending_id)"; exit;;
+esac
+# One foreground session; recover lock after a disconnected terminal.
+LOCK=/var/lock/owrt-pocket
+if ! mkdir "$LOCK" 2>/dev/null; then
+ pid=$(cat "$LOCK/pid" 2>/dev/null || :)
+ case "$pid" in ''|*[!0-9]*) bad 'Busy lock'; exit 1;; esac
+ if kill -0 "$pid" 2>/dev/null; then bad 'Another owp session is open'; exit 1; fi
+ rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null && mkdir "$LOCK" || exit 1
+fi
+printf '%s\n' "$$" > "$LOCK/pid"
+cleanup() { stty echo 2>/dev/null || :; rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null || :; }
+trap cleanup EXIT
+trap 'exit 130' INT TERM HUP
+case "${1:-}" in
+ '') main;; status) status;; clients) clients;; interfaces) interfaces;; doctor) doctor;; scan) lan_scan;;
+ *) printf 'owp [status|clients|interfaces|doctor|scan|confirm|rollback|demo|--version]\n'; exit 1;;
+esac
