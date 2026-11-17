@@ -9,11 +9,14 @@ build() {
  revision=$2
  curl --fail --location --retry 2 "https://codeload.github.com/openwrt/$repo/tar.gz/$revision" -o "$root/$repo.tar.gz"
  tar -xzf "$root/$repo.tar.gz" -C "$root"
- cmake -S "$root/$repo-$revision" -B "$root/$repo-build" \
+ build_dir=$root/$repo-build
+ # jsonpath's upstream parser generator uses source-relative paths.
+ [ "$repo" != jsonpath ] || build_dir=$root/$repo-$revision
+ cmake -S "$root/$repo-$revision" -B "$build_dir" \
   -DCMAKE_INSTALL_PREFIX="$prefix" -DCMAKE_INSTALL_LIBDIR=lib \
   -DCMAKE_PREFIX_PATH="$prefix" -DBUILD_LUA=OFF -DBUILD_EXAMPLES=OFF
- cmake --build "$root/$repo-build" --parallel 2
- cmake --install "$root/$repo-build"
+ cmake --build "$build_dir" --parallel 2
+ cmake --install "$build_dir"
 }
 build libubox a396f38a8568a1d670c240465cd8d24fdfdf6463
 build uci 74f6277aabffc943d026f406df57c22595134c42
