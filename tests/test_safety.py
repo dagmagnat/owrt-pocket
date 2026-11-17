@@ -275,7 +275,7 @@ grep -qx owp_wwan "$TX/down-interface"
     def test_native_uci_repeater_staging_and_dhcp_switch(self):
         self.run_shell('''
 mkdir -p "$TEST_ROOT/global-delta"
-uci() { "$OWP_REAL_UCI" -c "$CONFIG" -P "$TEST_ROOT/global-delta" "$@"; }
+uci() { "$OWP_REAL_UCI" -c "$CONFIG" -t "$TEST_ROOT/global-delta" "$@"; }
 # Use valid real UCI packages rather than the transaction-only text fixtures.
 : > "$CONFIG/network"; : > "$CONFIG/wireless"
 : > "$CONFIG/firewall"; : > "$CONFIG/dhcp"
