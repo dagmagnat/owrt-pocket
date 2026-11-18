@@ -1,15 +1,15 @@
 # OWRT Pocket
 
-A colourful SSH terminal companion for OpenWrt. **0.2.0 is experimental; use a spare router for hardware validation.** Russian and English menus, remembered language, `0` back, case-sensitive `Yes` for changes.
+A colourful SSH control panel for OpenWrt. **Version 0.3.0.** Russian and English menus, remembered language, `0` back, case-sensitive `Yes` for changes.
 
-Requires OpenWrt `/bin/sh`, UCI, ubus, jsonfilter, ip and nohup. No Python, Bash or cloud service is needed on the router. Target versions are OpenWrt 24.10/25.12; real hardware has not yet been validated.
+Requires OpenWrt `/bin/sh`, UCI, ubus, jsonfilter and ip. Wi-Fi client details use the system's `jshn` and hostapd. Target versions are OpenWrt 24.10/25.12.
 
 ```sh
 wget -O /tmp/owrt-pocket-install.sh https://raw.githubusercontent.com/dagmagnat/owrt-pocket/main/install.sh && sh /tmp/owrt-pocket-install.sh
 ```
 
 Run that single command in the router's SSH session. The router downloads the
-pinned 0.2.0 menu directly from GitHub and verifies its SHA-256 before installation.
+pinned 0.3.0 menu directly from GitHub and verifies its SHA-256 before installation.
 No archive or manual file transfer is needed. After the success message, run:
 
 ```sh
@@ -30,6 +30,8 @@ Offline installation remains available: transfer and extract the complete projec
 then run `sh install.sh --local` from its directory.
 
 Commands: `owp`, `owp status`, `owp clients`, `owp interfaces`, `owp doctor`, `owp scan`, `owp confirm`, `owp rollback`, `owp demo`. Change language in menu 9 → 1. `NO_COLOR=1` disables ANSI colours. Run `sh src/owp demo` on a normal computer for a synthetic preview.
+
+Status displays CPU, RAM and flash usage as percentages. Clients are grouped by MAC and show their name, IPv4 and presence when known. Interfaces show connection state, addresses, one-second RX/TX rates and cumulative device counters. Press `1` on the interfaces screen to sample again. Use `owp doctor --details` for technical output. For terminals that support ANSI but miss automatic colour detection, run `OWP_COLOR=always owp`.
 
 Features include status/RAM/storage/routes, DHCP and Wi-Fi client inspection, current-lease MAC/IP reservations, temporary 60-second Wi-Fi client bans, Wi-Fi on/off and personal WPA2/WPA3 credentials, network/DNS/VPN diagnostics, bounded LAN ICMP scanning, DNS restart, WAN renew, temporary VPN service stops, basic tunnel interface management, package installation through apk/opkg, service status and root password changes.
 

@@ -36,7 +36,6 @@ uci() { :; }
 ubus() { :; }
 jsonfilter() { :; }
 ip() { :; }
-nohup() { :; }
 wget() {
  printf '%s\n' "$3" >> "$TEST_ROOT/downloads"
  if [ "$DOWNLOAD_MODE" = live ]; then

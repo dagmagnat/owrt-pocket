@@ -5,7 +5,7 @@ umask 077
 fail() { printf 'OWRT Pocket: %s\n' "$*" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || fail 'Запустите установку от root / Run as root'
 [ -f /etc/openwrt_release ] || fail 'Требуется OpenWrt / OpenWrt required'
-for cmd in uci ubus jsonfilter ip nohup; do
+for cmd in uci ubus jsonfilter ip; do
  command -v "$cmd" >/dev/null || fail "Нет команды / Missing: $cmd"
 done
 [ ! -s /etc/owrt-pocket/pending ] || fail 'Сначала подтвердите или откатите ожидающее изменение: owp confirm / owp rollback'
@@ -28,10 +28,10 @@ if [ "${1:-}" = --local ]; then
  cp "$DIR/src/owp" "$WORK/owp"
 else
  # Pin the payload and its digest together; downloading just this installer is enough.
- URL=https://raw.githubusercontent.com/dagmagnat/owrt-pocket/d618a186529f31666f654ee9dee6a3c3d5f6399f/src/owp
- SHA256=41e06fb4f1157cd550e4ab685502f392a498d7ce2dc86b0ff92b89ef88cfada5
+ URL=https://raw.githubusercontent.com/dagmagnat/owrt-pocket/8c8562982ff7560914737e14baa3ddea21503b32/src/owp
+ SHA256=b4917a6d2a51b5f37c7afd531d3ee2f49328246101048b065786a05fc01f98f2
  command -v sha256sum >/dev/null || fail 'Нет sha256sum / Missing sha256sum'
- printf 'Скачивание OWRT Pocket 0.2.0 / Downloading OWRT Pocket 0.2.0...\n'
+ printf 'Скачивание OWRT Pocket 0.3.0 / Downloading OWRT Pocket 0.3.0...\n'
  if command -v wget >/dev/null; then
   wget -O "$WORK/owp" "$URL" || fail 'Не удалось скачать с GitHub. Проверьте интернет, DNS, дату и HTTPS-сертификаты.'
  elif command -v curl >/dev/null; then

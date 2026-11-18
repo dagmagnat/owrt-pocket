@@ -30,7 +30,6 @@ printf 'original-network\\n' > "$CONFIG/network"
 printf 'original-wireless\\n' > "$CONFIG/wireless"
 uci() { return 0; }
 reload_all() { printf 'reload\\n' >> "$TEST_ROOT/reloads"; }
-nohup() { :; }
 sleep() { :; }
 ubus() { "$PYTHON" "$FIXTURE" ubus "$@"; }
 jsonfilter() {
@@ -143,7 +142,47 @@ if begin; then exit 1; fi
                                 capture_output=True, timeout=10,
                                 env=dict(os.environ, NO_COLOR='1'))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('synthetic data', result.stdout)
+        self.assertIn('DEMO', result.stdout)
+        self.assertIn('0.3.0', result.stdout)
+
+    def test_detached_command_survives_hangup(self):
+        self.run_shell("""
+detached sh -c 'kill -HUP "$$"; printf alive' > "$TEST_ROOT/detached" &
+wait "$!"
+grep -qx alive "$TEST_ROOT/detached"
+""")
+
+    def test_client_records_merge_sources_without_reporting_stale_leases_online(self):
+        result = self.run_shell("""
+jsonfilter() { cat >/dev/null; printf 'br-lan\\n'; }
+ip() {
+ [ "$*" = '-4 neigh show dev br-lan' ] || return 1
+ printf '%s\\n' '192.168.10.145 lladdr 02:00:00:00:00:01 REACHABLE'
+ printf '%s\\n' '192.168.10.160 lladdr 02:00:00:00:00:02 STALE'
+}
+wifi_clients() { printf 'wifi|02:00:00:00:00:01|-51\\n'; }
+printf '%s\\n' '0 02:00:00:00:00:01 192.168.10.145 Phone *' \\
+ '0 02:00:00:00:00:02 192.168.10.160 Laptop *' > "$TEST_ROOT/leases"
+client_rows "$TEST_ROOT/leases"
+""")
+        self.assertEqual(result.splitlines(), [
+            '02:00:00:00:00:01|192.168.10.145|Phone|wifi|-51|',
+            '02:00:00:00:00:02|192.168.10.160|Laptop|unknown||',
+        ])
+
+    def test_traffic_distinguishes_current_rate_total_and_reset(self):
+        result = self.run_shell("""
+traffic_snapshot() {
+ if mkdir "$TEST_ROOT/sample" 2>/dev/null; then
+  printf '%s\\n' 'time 100' 'eth0.2 100000 200000' 'eth1 3000 4000'
+ else
+  printf '%s\\n' 'time 101' 'eth0.2 100125 201000' 'eth1 10 20'
+ fi
+}
+traffic_rows
+""")
+        self.assertIn('eth0.2|1.0 kbit/s|8.0 kbit/s|97.8 KiB|196.3 KiB', result)
+        self.assertIn('eth1|—|—|10 B|20 B', result)
 
     def test_subnet_overlap_handles_non_24_masks(self):
         self.run_shell('''
