@@ -11,6 +11,10 @@ jobs:
       - run: shellcheck -S warning -s sh src/owp install.sh
       - run: busybox ash -n src/owp && busybox ash -n install.sh
       - run: python3 -m unittest discover -s tests -v
+      - name: Install from GitHub in an isolated filesystem
+        env:
+          OWP_INSTALL_LIVE_DOWNLOAD: '1'
+        run: python3 -m unittest discover -s tests -p test_install.py -v
       - name: Build pinned upstream UCI and jsonfilter
         run: |
           sudo apt-get install -y cmake build-essential pkg-config libjson-c-dev

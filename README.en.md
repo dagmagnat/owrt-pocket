@@ -5,15 +5,29 @@ A colourful SSH terminal companion for OpenWrt. **0.2.0 is experimental; use a s
 Requires OpenWrt `/bin/sh`, UCI, ubus, jsonfilter, ip and nohup. No Python, Bash or cloud service is needed on the router. Target versions are OpenWrt 24.10/25.12; real hardware has not yet been validated.
 
 ```sh
-cd /tmp
-wget -O owrt-pocket.tar.gz https://codeload.github.com/dagmagnat/owrt-pocket/tar.gz/refs/heads/main
-tar -xzf owrt-pocket.tar.gz
-cd owrt-pocket-main
-sh install.sh
+wget -O /tmp/owrt-pocket-install.sh https://raw.githubusercontent.com/dagmagnat/owrt-pocket/main/install.sh && sh /tmp/owrt-pocket-install.sh
+```
+
+Run that single command in the router's SSH session. The router downloads the
+pinned 0.2.0 menu directly from GitHub and verifies its SHA-256 before installation.
+No archive or manual file transfer is needed. After the success message, run:
+
+```sh
 owp
 ```
 
-Review the code first, save an off-device OpenWrt backup, and keep Ethernet recovery access. Pin a reviewed commit instead of `main` for reproducibility. Offline installation works by copying the full archive using SCP/SFTP.
+Review [install.sh](install.sh), save an off-device OpenWrt backup, and keep Ethernet
+recovery access. HTTPS internet access is required; check DNS, time and certificates
+if downloads fail. Never disable certificate verification. If wget is unavailable:
+
+```sh
+curl -fL -o /tmp/owrt-pocket-install.sh https://raw.githubusercontent.com/dagmagnat/owrt-pocket/main/install.sh && sh /tmp/owrt-pocket-install.sh
+```
+
+The same command reinstalls the tool while preserving language and settings.
+Pending network changes must be confirmed or rolled back before installation.
+Offline installation remains available: transfer and extract the complete project,
+then run `sh install.sh --local` from its directory.
 
 Commands: `owp`, `owp status`, `owp clients`, `owp interfaces`, `owp doctor`, `owp scan`, `owp confirm`, `owp rollback`, `owp demo`. Change language in menu 9 → 1. `NO_COLOR=1` disables ANSI colours. Run `sh src/owp demo` on a normal computer for a synthetic preview.
 
