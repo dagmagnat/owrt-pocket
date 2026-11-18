@@ -1,8 +1,10 @@
 #!/bin/sh
 # owrt-pocket — MIT; OpenWrt BusyBox ash, no bash/python dependencies.
+# OpenWrt ash supports local variables.
+# shellcheck disable=SC3043
 set -u
 umask 077
-VERSION=0.2.0
+VERSION=0.3.0
 BASE=/etc/owrt-pocket
 SELF=/usr/sbin/owp
 CONFIG=/etc/config
@@ -10,7 +12,8 @@ TX=
 LANGUAGE=ru
 [ ! -r "$BASE/language" ] || read -r LANGUAGE < "$BASE/language"
 R='' G='' Y='' B='' D='' Z=''
-if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ] && [ -z "${NO_COLOR:-}" ]; then
+if [ -z "${NO_COLOR:-}" ] && [ "${OWP_COLOR:-auto}" != never ] &&
+   { [ "${OWP_COLOR:-auto}" = always ] || { [ -t 1 ] && [ "${TERM:-xterm}" != dumb ]; }; }; then
  R=$(printf '\033[91m'); G=$(printf '\033[92m'); Y=$(printf '\033[93m')
  B=$(printf '\033[96m'); D=$(printf '\033[1m'); Z=$(printf '\033[0m')
 fi
@@ -94,6 +97,12 @@ begin() {
   else touch "$TX/absent-$f" "$TX/stage/$f"; fi
  done
 }
+# Keep workers alive across SSH hangup using the shell itself. Their caller
+# redirects stdin, stdout and stderr before starting them in the background.
+detached() (
+ trap '' HUP
+ exec "$@"
+)
 apply() {
  for f in network wireless dhcp firewall; do stage commit "$f" || return 1; done
  for f in network wireless dhcp firewall; do
@@ -104,12 +113,12 @@ apply() {
  yes || return 1
  id=${TX##*/}
  printf '%s\n' "$id" > "$BASE/pending"
- nohup "$SELF" _apply "$id" </dev/null >"$TX/apply.log" 2>&1 &
+ detached "$SELF" _apply "$id" </dev/null >"$TX/apply.log" 2>&1 &
  say "$(t 'Применение запущено. При потере SSH подключитесь снова.' 'Applying. Reconnect if SSH disconnects.')"
 }
 worker() {
  load_tx "$1" || exit 1
- nohup "$SELF" _watch "$1" </dev/null >"$TX/watch.log" 2>&1 &
+ detached "$SELF" _watch "$1" </dev/null >"$TX/watch.log" 2>&1 &
  sleep 2
  for f in network wireless dhcp firewall; do
   cp -p "$TX/stage/$f" "$CONFIG/$f" || { rollback "$1"; exit 1; }
@@ -139,46 +148,330 @@ confirm() {
  [ ! -f "$TX/repeater" ] || t 'Настройки повторителя сохранены. Фактическое соединение: owp repeater-status.' 'Repeater settings saved. Current connection: owp repeater-status.' > "$BASE/repeater-result"
  ok "$(t 'Сохранено' 'Saved')"
 }
-status() {
- say "$(t 'СОСТОЯНИЕ РОУТЕРА' 'ROUTER STATUS')"
- ubus call system board
- uptime
- free -m
- df -h /overlay /tmp 2>/dev/null
- say "$(t 'Адреса и маршруты' 'Addresses and routes')"
- ip -4 addr show
- ip -4 route show
- ip -6 route show default
- say "$(t 'Wi-Fi: фактическое состояние' 'Wi-Fi: runtime status')"
- ubus call network.wireless status | jsonfilter -e '@.*.up' | while read -r state; do
-  if [ "$state" = true ]; then ok "$(t 'ВКЛЮЧЁН: ДА' 'ENABLED: YES')"; else bad "$(t 'ВКЛЮЧЁН: НЕТ' 'ENABLED: NO')"; fi
- done
+panel() {
+ printf '\n%s%s━━ %s%s\n\n' "$B" "$D" "$1" "$Z"
 }
-interfaces() {
- for n in $(sections network interface); do
-  say "$n  [$(get network.$n.proto)]  $(get network.$n.device)"
-  data=$(ubus call "network.interface.$n" status 2>/dev/null) || continue
-  up=$(printf '%s' "$data" | jsonfilter -e '@.up')
-  if [ "$up" = true ]; then ok "$(t 'Подключён: ДА' 'Connected: YES')"; else bad "$(t 'Подключён: НЕТ' 'Connected: NO')"; fi
-  printf '%s' "$data" | jsonfilter -e '@["ipv4-address"][*].address' -e '@["ipv6-address"][*].address'
- done
- say "$(t 'Счётчики RX/TX (байты, не скорость)' 'RX/TX counters (bytes, not speed)')"
- ip -s link
+
+field() {
+ printf '  %s%s%s  %s\n' "$D" "$1" "$Z" "$2"
 }
-clients() {
- say "$(t 'DHCP-аренды (не доказательство присутствия)' 'DHCP leases (not proof of presence)')"
- [ ! -r /tmp/dhcp.leases ] || awk '{print $2, $3, $4}' /tmp/dhcp.leases
- say "$(t 'Соседи LAN' 'LAN neighbours')"; ip neigh show
- for obj in $(ubus list 'hostapd.*'); do
-  say "$obj"; ubus call "$obj" get_clients
- done
- if command -v iw >/dev/null; then
-  iw dev | awk '$1=="Interface"{print $2}' | while read -r dev; do
-   say "$dev"; iw dev "$dev" station dump
-  done
+
+badge() {
+ local color
+ case "$1" in good) color=$G;; bad) color=$R;; *) color=$Y;; esac
+ printf '%s[%s]%s' "$color" "$2" "$Z"
+}
+
+option() {
+ printf '  %s%s %s %s  %s\n' "$B" "$D" "$1" "$Z" "$2"
+}
+
+dashboard_screen() {
+ if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ] && [ "${OWP_NO_CLEAR:-0}" != 1 ]; then
+  printf '\033[2J\033[H'
  fi
 }
-doctor() {
+
+display_text() {
+ LC_ALL=C tr -d '\000-\037\177'
+}
+
+json_value() {
+ printf '%s' "$1" | jsonfilter -e "$2" 2>/dev/null || :
+}
+
+ram_usage() {
+ awk '
+  $1=="MemTotal:" {total=$2}
+  $1=="MemAvailable:" {available=$2; known=1}
+  END {if (total>0 && known && available<=total)
+        printf "%d %.1f %.1f\n", 100*(total-available)/total, (total-available)/1024, total/1024}
+ ' /proc/meminfo 2>/dev/null
+}
+
+cpu_sample() {
+ awk '$1=="cpu" {for (i=2;i<=9;i++) total+=$i; printf "%.0f %.0f\n", total,$5+$6; exit}' /proc/stat 2>/dev/null
+}
+
+cpu_usage() {
+ local before after
+ before=$(cpu_sample)
+ sleep 1
+ after=$(cpu_sample)
+ printf '%s\n%s\n' "$before" "$after" | awk '
+  NR==1 {total=$1; idle=$2; valid=NF==2}
+  NR==2 && valid && NF==2 && $1>total && $2>=idle && $2-idle<=$1-total {
+    printf "%.0f\n", 100*(1-($2-idle)/($1-total))
+  }'
+}
+
+meter() {
+ local percent=$2 cells color index=0
+ case "$percent" in ''|*[!0-9]*) field "$1" '—'; return;; esac
+ cells=$((percent / 10))
+ color=$G
+ if [ "$percent" -ge 90 ]; then color=$R
+ elif [ "$percent" -ge 70 ]; then color=$Y; fi
+ printf '  %s%s%s  %s%3s%%  [' "$D" "$1" "$Z" "$color" "$percent"
+ while [ "$index" -lt 10 ]; do
+  if [ "$index" -lt "$cells" ]; then printf '█'; else printf '░'; fi
+  index=$((index + 1))
+ done
+ printf ']%s %s\n' "$Z" "${3:-}"
+}
+
+address_list() {
+ json_value "$1" "$2" | awk 'NF {printf "%s%s", sep, $0; sep=", "}'
+}
+
+route_badge() {
+ if [ -n "$1" ]; then badge good "$(t 'МАРШРУТ ЕСТЬ' 'ROUTE PRESENT')"
+ else badge bad "$(t 'НЕТ МАРШРУТА' 'NO ROUTE')"; fi
+}
+
+wifi_badge() {
+ case "$1" in
+  *true*) badge good "$(t 'ВКЛЮЧЁН' 'ON')";;
+  *false*) badge bad "$(t 'ВЫКЛЮЧЕН' 'OFF')";;
+  *) badge warn "$(t 'НЕТ ДАННЫХ' 'UNKNOWN')";;
+ esac
+}
+
+status() {
+ local board model release memory flash days lan wan wireless route6 route4
+ panel "$(t '01  Состояние роутера' '01  Router status')"
+ board=$(ubus call system board 2>/dev/null || :)
+ model=$(json_value "$board" '@.model' | display_text)
+ release=$(json_value "$board" '@.release.version' | display_text)
+ days=$(awk '{print int($1/86400), int($1/3600)%24, int($1/60)%60}' /proc/uptime 2>/dev/null)
+ field "$(t 'Роутер' 'Router')" "${model:-OpenWrt}"
+ field "$(t 'Прошивка' 'Firmware')" "OpenWrt ${release:-—}"
+ if [ -n "$days" ]; then
+  # The uptime sampler emits exactly three integers.
+  set -- $days
+  field "$(t 'Время работы' 'Uptime')" "$1 $(t 'д' 'd') $2 $(t 'ч' 'h') $3 $(t 'мин' 'min')"
+ fi
+ printf '\n'
+ meter CPU "$(cpu_usage)"
+ memory=$(ram_usage)
+ set -- $memory
+ meter "$(t 'ОЗУ' 'RAM')" "${1:-}" "${2:-—} / ${3:-—} MiB"
+ flash=$(df -h /overlay 2>/dev/null | awk '$NF=="/overlay" {sub(/%$/, "", $(NF-1)); print $(NF-1),$(NF-3),$(NF-4),$(NF-2)}')
+ set -- $flash
+ meter Flash "${1:-}" "${2:-—} / ${3:-—}"
+ [ "$#" -lt 4 ] || field "$(t 'Свободно во flash' 'Free flash space')" "$4"
+ lan=$(ubus call network.interface.lan status 2>/dev/null || :)
+ wan=$(ubus call network.interface.wan status 2>/dev/null || :)
+ wireless=$(ubus call network.wireless status 2>/dev/null || :)
+ route4=$(ip -4 route show default 2>/dev/null || :)
+ route6=$(ip -6 route show default 2>/dev/null || :)
+ printf '\n'
+ lan=$(address_list "$lan" '@["ipv4-address"][*].address')
+ wan=$(address_list "$wan" '@["ipv4-address"][*].address')
+ field 'LAN IPv4' "${lan:-—}"
+ field 'WAN IPv4' "${wan:-—}"
+ field 'Wi-Fi' "$(wifi_badge "$(json_value "$wireless" '@.*.up')")"
+ field "$(t 'Выход в интернет' 'Internet routing')" "$(route_badge "$route4$route6")"
+ printf '  %s\n' "$(t 'Проверить доступ и DNS → пункт 5' 'Check reachability and DNS → menu 5')"
+}
+
+traffic_snapshot() {
+ awk 'FNR==1 && FILENAME=="/proc/uptime" {print "time", $1}
+      $1 ~ /:$/ && NF>=17 {sub(/:$/, "", $1); print $1,$2,$10}' /proc/uptime /proc/net/dev 2>/dev/null
+}
+
+traffic_rows() {
+ local before
+ before=$(traffic_snapshot)
+ sleep 1
+ { printf '%s\n---\n' "$before"; traffic_snapshot; } | awk '
+  function sized(n, unit, base,   i, names){
+   split(unit,names," "); for(i=1; n>=base && i<4; i++) n/=base
+   return sprintf(i==1?"%.0f %s":"%.1f %s", n, names[i])
+  }
+  /^---$/ {second=1; next}
+  $1=="time" {if(second) elapsed=$2-start; else start=$2; next}
+  NF!=3 {next}
+  !second {rx[$1]=$2; tx[$1]=$3; next}
+  {
+   down=up="—"
+   if ($1 in rx && elapsed>0 && $2>=rx[$1] && $3>=tx[$1]) {
+    down=sized(8*($2-rx[$1])/elapsed,"bit/s kbit/s Mbit/s Gbit/s",1000)
+    up=sized(8*($3-tx[$1])/elapsed,"bit/s kbit/s Mbit/s Gbit/s",1000)
+   }
+   printf "%s|%s|%s|%s|%s\n",$1,down,up,sized($2,"B KiB MiB GiB",1024),sized($3,"B KiB MiB GiB",1024)
+  }'
+}
+
+interface_badge() {
+ case "$1:$2:$3" in
+  true:*) badge good "$(t 'ПОДКЛЮЧЁН' 'CONNECTED')";;
+  false:true:*) badge warn "$(t 'ПОДКЛЮЧАЕТСЯ' 'CONNECTING')";;
+  false:*:0) badge bad "$(t 'ОТКЛЮЧЁН' 'DISABLED')";;
+  false:*) badge bad "$(t 'НЕТ СОЕДИНЕНИЯ' 'DISCONNECTED')";;
+  *) badge warn "$(t 'НЕТ ДАННЫХ' 'UNKNOWN')";;
+ esac
+}
+
+interfaces() {
+ local names traffic name data proto dev ipv4s ipv6s state row rx tx total_rx total_tx
+ panel "$(t '03  Интерфейсы и трафик' '03  Interfaces and traffic')"
+ names=$(sections network interface)
+ if [ -z "$names" ]; then say "$(t 'Интерфейсы не найдены' 'No interfaces found')"; return; fi
+ printf '  %s\n' "$(t 'Замер текущего трафика · 1 секунда' 'Sampling current traffic · 1 second')"
+ traffic=$(traffic_rows)
+ for name in $names; do
+  ident "$name" && [ "$name" != loopback ] || continue
+  data=$(ubus call "network.interface.$name" status 2>/dev/null || :)
+  proto=$(json_value "$data" '@.proto' | display_text)
+  [ -n "$proto" ] || proto=$(get "network.$name.proto" | display_text)
+  dev=$(json_value "$data" '@.l3_device')
+  [ -n "$dev" ] || dev=$(json_value "$data" '@.device')
+  devname "$dev" || dev=
+  ipv4s=$(address_list "$data" '@["ipv4-address"][*].address')
+  ipv6s=$(address_list "$data" '@["ipv6-address"][*].address')
+  case "$name" in lan) state=LAN;; wan) state=WAN;; wan6) state=WAN6;; *) state=$name;; esac
+  printf '\n  %s%s%s  %s\n' "$D" "$state" "$Z" "$(interface_badge "$(json_value "$data" '@.up')" "$(json_value "$data" '@.pending')" "$(get "network.$name.auto")")"
+  field "$(t 'Тип / устройство' 'Type / device')" "${proto:-—} / ${dev:-—}"
+  field 'IPv4' "${ipv4s:-—}"
+  [ -z "$ipv6s" ] || field 'IPv6' "$ipv6s"
+  row=$(printf '%s\n' "$traffic" | awk -F '|' -v dev="$dev" 'NF==5 && $1==dev {print; exit}')
+  if [ -n "$row" ]; then
+   IFS='|' read -r _ rx tx total_rx total_tx <<EOF
+$row
+EOF
+   traffic_fields "$rx" "$tx" "$total_rx" "$total_tx"
+  else
+   field "$(t 'Трафик' 'Traffic')" '—'
+  fi
+ done
+ printf '\n  %s\n' "$(t '↓ приём  ↑ передача · счётчики устройства' '↓ received  ↑ sent · device counters')"
+}
+
+traffic_fields() {
+ field "$(t 'Сейчас' 'Current')" "↓ $1  ↑ $2"
+ field "$(t 'Накоплено' 'Total')" "↓ $3  ↑ $4"
+}
+
+wifi_clients() (
+ # OpenWrt's JSON shell helpers use unset variables internally.
+ [ -r /usr/share/libubox/jshn.sh ] && command -v jshn >/dev/null || return 0
+ set +u
+ # shellcheck disable=SC1091
+ . /usr/share/libubox/jshn.sh
+ for object in $(ubus list 'hostapd.*' 2>/dev/null); do
+  data=$(ubus call "$object" get_clients 2>/dev/null) || continue
+  json_load "$data" && json_select clients || continue
+  keys=
+  json_get_keys keys ''
+  for key in $keys; do
+   json_select "$key" || continue
+   associated=
+   json_get_var associated assoc
+   if [ "$associated" = 1 ]; then
+    mac=$(printf '%s' "$key" | tr '_' ':')
+    json_get_var signal signal
+    printf 'wifi|%s|%s\n' "$mac" "$signal"
+   fi
+   json_select ..
+  done
+ done
+)
+
+client_rows() {
+ local lan lan_dev section reservation mac
+ lan=$(ubus call network.interface.lan status 2>/dev/null || :)
+ lan_dev=$(json_value "$lan" '@.l3_device')
+ [ -n "$lan_dev" ] || lan_dev=$(json_value "$lan" '@.device')
+ {
+  [ ! -r "${1:-/tmp/dhcp.leases}" ] || awk 'NF>=4 {print "dhcp|"$2"|"$3"|"$4}' "${1:-/tmp/dhcp.leases}"
+  if devname "$lan_dev"; then
+   ip -4 neigh show dev "$lan_dev" 2>/dev/null | awk '{for (i=2;i<NF;i++) if ($i=="lladdr") print "lan|"$(i+1)"|"$1"|"$NF}'
+  fi
+  wifi_clients
+  for section in $(sections dhcp host); do
+   reservation=$(get "dhcp.$section.ip")
+   [ -n "$reservation" ] || continue
+   for mac in $(get "dhcp.$section.mac"); do printf 'fixed|%s|%s\n' "$mac" "$reservation"; done
+  done
+ } | LC_ALL=C awk -F '|' '
+  {
+   mac=tolower($2)
+   if (mac !~ /^([0-9a-f][0-9a-f]:){5}[0-9a-f][0-9a-f]$/ || mac=="00:00:00:00:00:00") next
+   if ($1=="fixed") {fixed[mac]=$3; next}
+   if (!(mac in seen)) {seen[mac]=1; order[++count]=mac}
+   if ($1=="dhcp") {lease[mac]=$3; name[mac]=$4}
+   if ($1=="lan" && (!(mac in neigh) || $4=="REACHABLE")) {neigh[mac]=$3; reach[mac]=$4}
+   if ($1=="wifi") {wifi[mac]=1; signal[mac]=$3}
+  }
+  END {
+   for (i=1;i<=count;i++) {
+    m=order[i]; state=wifi[m]?"wifi":reach[m]=="REACHABLE"?"lan":"unknown"
+    ip=reach[m]=="REACHABLE"?neigh[m]:(lease[m]?lease[m]:neigh[m])
+    printf "%s|%s|%s|%s|%s|%s\n",m,ip,name[m],state,signal[m],fixed[m]
+   }
+  }'
+}
+
+client_cards() {
+ local mac addr name state signal fixed index=0 label
+ while IFS='|' read -r mac addr name state signal fixed; do
+  [ -n "$mac" ] || continue
+  index=$((index + 1))
+  [ "$name" != '*' ] || name=
+  case "$state" in
+   wifi) label=$(badge good 'Wi-Fi');;
+   lan) label=$(badge good "$(t 'В ЛОКАЛЬНОЙ СЕТИ' 'REACHABLE ON LAN')");;
+   *) label=$(badge warn "$(t 'СВЯЗЬ НЕ ПОДТВЕРЖДЕНА' 'PRESENCE UNCONFIRMED')");;
+  esac
+  printf '  %s%02d  %s%s  %s\n' "$D" "$index" "${name:-$(t 'Без имени' 'Unnamed')}" "$Z" "$label"
+  field 'IPv4' "${addr:-—}"
+  field 'MAC' "$mac"
+  if [ -n "$fixed" ]; then field "$(t 'Привязанный IP' 'Reserved IP')" "$fixed"; fi
+  if [ -n "$signal" ]; then field "$(t 'Сигнал' 'Signal')" "$signal dBm"; fi
+  printf '\n'
+ done
+}
+
+clients() {
+ local rows summary
+ panel "$(t '02  Клиенты и привязки IP' '02  Clients and IP reservations')"
+ rows=$(client_rows)
+ if [ -z "$rows" ]; then say "$(t 'Клиенты не обнаружены' 'No clients found')"; return; fi
+ summary=$(printf '%s\n' "$rows" | awk -F '|' '{if ($4=="wifi") w++; else if ($4=="lan") l++; else u++}
+  END {printf "%d / %d / %d", w,l,u}')
+ field "$(t 'Wi-Fi / LAN / не подтверждены' 'Wi-Fi / LAN / unconfirmed')" "$summary"
+ printf '\n'
+ printf '%s\n' "$rows" | LC_ALL=C tr -d '\000-\011\013-\037\177' | client_cards
+}
+
+doctor_summary() {
+ local routes gateway
+ panel "$(t '05  Диагностика сети' '05  Network diagnostics')"
+ routes=$(ip -4 route show default 2>/dev/null || :)
+ field "$(t 'Маршрут IPv4' 'IPv4 routing')" "$(route_badge "$routes")"
+ field "$(t 'Маршрут IPv6' 'IPv6 routing')" "$(route_badge "$(ip -6 route show default 2>/dev/null || :)")"
+ gateway=$(printf '%s\n' "$routes" | awk '/via/{print $3;exit}')
+ [ -z "$gateway" ] || probe "$(t 'Шлюз' 'Gateway') $gateway" ping -c 1 -W 2 "$gateway"
+ if [ -n "$routes" ]; then
+  probe "$(t 'Внешний IP' 'External IP') 1.1.1.1" ping -c 1 -W 2 1.1.1.1
+ fi
+ if nslookup openwrt.org 127.0.0.1 >/dev/null 2>&1; then
+  field DNS "$(badge good "$(t 'ОТВЕЧАЕТ' 'RESPONDING')")"
+ else
+  field DNS "$(badge bad "$(t 'ИМЯ НЕ РАЗРЕШИЛОСЬ' 'LOOKUP FAILED')")"
+ fi
+}
+
+probe() {
+ local label=$1
+ shift
+ if "$@" >/dev/null 2>&1; then field "$label" "$(badge good "$(t 'ОТВЕТИЛ' 'RESPONDED')")"
+ else field "$label" "$(badge warn "$(t 'НЕТ ОТВЕТА ICMP' 'NO ICMP RESPONSE')")"; fi
+}
+
+
+doctor_details() {
  say "$(t 'ДИАГНОСТИКА — без изменения настроек' 'DIAGNOSTICS — read only')"
  say "$(t 'LAN и физические порты' 'LAN and physical links')"
  ip -br addr 2>/dev/null || ip addr
@@ -237,7 +530,12 @@ wifi_menu() {
  ask '>' || return
  case "$ANSWER" in
   1|2)
-   choice=$ANSWER; begin || return
+   choice=$ANSWER
+   if [ "$choice" = 2 ] && [ -f "$BASE/wifi-always-on" ]; then
+    bad "$(t 'В этой прошивке Wi-Fi должен оставаться включённым' 'Wi-Fi must stay enabled on this firmware')"
+    return
+   fi
+   begin || return
    for n in $(sections wireless wifi-device); do stage set "wireless.$n.disabled=$((choice - 1))" || return; done
    say "$(t 'Wi-Fi изменится. SSH по Wi-Fi может оборваться.' 'Wi-Fi changes may disconnect SSH.')"; apply;;
   3)
@@ -262,7 +560,9 @@ secret() {
 }
 client_menu() {
  clients
- say "$(t '1 Привязать IPv4 к MAC | 2 Отключить Wi-Fi клиента на 60 с | 0 Назад' '1 Reserve IPv4 for MAC | 2 Disconnect Wi-Fi client for 60s | 0 Back')"
+ option 1 "$(t 'Привязать IPv4 к MAC' 'Reserve IPv4 for MAC')"
+ option 2 "$(t 'Отключить Wi-Fi клиента на 60 с' 'Disconnect Wi-Fi client for 60s')"
+ option 0 "$(t 'Назад' 'Back')"
  ask '>' || return; action=$ANSWER
  case "$action" in 1|2) :;; *) return;; esac
  ask 'MAC:' || return; mac=$ANSWER; mac_valid "$mac" || return
@@ -558,7 +858,7 @@ repair() {
    case "$svc" in openvpn|sing-box|xray|tailscale) :;; *) return;; esac
    [ -x "/etc/init.d/$svc" ] && /etc/init.d/"$svc" running || { bad 'Service not running'; return; }
    yes || return
-   nohup "$SELF" _vpn "$svc" </dev/null >"$BASE/vpn.log" 2>&1 &;;
+   detached "$SELF" _vpn "$svc" </dev/null >"$BASE/vpn.log" 2>&1 &;;
   4)
    interfaces
    ask "$(t 'Имя VPN/интерфейса (0 назад):' 'VPN/interface name (0 back):')" || return; n=$ANSWER
@@ -601,60 +901,119 @@ language() {
  case "$ANSWER" in 1) LANGUAGE=ru;; 2) LANGUAGE=en;; *) return;; esac
  printf '%s\n' "$LANGUAGE" > "$BASE/language"
 }
-demo() {
- printf '%s%s┌──────────────────────────────┐%s\n' "$B" "$D" "$Z"
- say '│  OWRT POCKET / DEMO           │'
- say '└──────────────────────────────┘'
- ok 'Wi-Fi: ВКЛЮЧЁН / ENABLED'
- ok 'WAN: ПОДКЛЮЧЁН / CONNECTED'
- bad 'VPN: ОТКЛЮЧЁН / DISABLED'
- printf 'LAN   192.168.1.1\nRAM   68 / 256 MiB\nWi-Fi clients   3\n'
- say '1 Состояние / Status'
- say '2 Клиенты / Clients'
- say '3 Интерфейсы / Interfaces'
- say '4 Wi-Fi'
- say '5 Диагностика / Diagnostics'
- say '6 Исправления / Repairs'
- say '7 Интернет / Internet'
- say '8 Пакеты / Packages'
- say '9 Настройки / Settings'
- say '0 Выход / Exit'
- printf '\nDEMO: synthetic data; no router commands executed.\n'
+menu_options() {
+ option 1 "$(t 'Состояние роутера' 'Router status')"
+ option 2 "$(t 'Клиенты и привязки IP' 'Clients and IP reservations')"
+ option 3 "$(t 'Интерфейсы и трафик' 'Interfaces and traffic')"
+ option 4 'Wi-Fi'
+ option 5 "$(t 'Диагностика сети' 'Network diagnostics')"
+ option 6 "$(t 'Исправления и VPN' 'Repairs and VPN')"
+ option 7 "$(t 'Интернет / повторитель / LAN IP' 'Internet / repeater / LAN IP')"
+ option 8 "$(t 'Пакеты' 'Packages')"
+ option 9 "$(t 'Настройки' 'Settings')"
+ option 0 "$(t 'Выход' 'Exit')"
 }
+
+demo() {
+ panel "OWRT POCKET $VERSION · DEMO"
+ case "${1:-}" in
+  status)
+   field "$(t 'Роутер' 'Router')" 'Cudy WR300 v1'
+   field "$(t 'Прошивка' 'Firmware')" 'OpenWrt 25.12.6'
+   printf '\n'
+   meter CPU 12
+   meter "$(t 'ОЗУ' 'RAM')" 38 '21.3 / 56.6 MiB'
+   meter Flash 74 '830 / 1120 KiB'
+   field 'LAN IPv4' '192.168.10.1'
+   field 'Wi-Fi' "$(wifi_badge true)"
+   ;;
+  clients)
+   printf '%s\n' '02:00:00:00:00:01|192.168.10.145|Phone|wifi|-51|' \
+    '02:00:00:00:00:02|192.168.10.160|Laptop|unknown||192.168.10.160' | client_cards
+   ;;
+  interfaces)
+   field WAN "$(interface_badge true false 1)"
+   field "$(t 'Тип / устройство' 'Type / device')" 'dhcp / eth0.2'
+   field IPv4 '192.168.131.242'
+   traffic_fields '12.4 Mbit/s' '320.0 kbit/s' '158.3 MiB' '24.7 MiB'
+   ;;
+  *)
+   field 'Wi-Fi' "$(wifi_badge true)"
+   field 'LAN IPv4' '192.168.10.1'
+   meter "$(t 'ОЗУ' 'RAM')" 38 '21.3 / 56.6 MiB'
+   printf '\n'
+   menu_options
+   ;;
+ esac
+ printf '\n  %s\n' "$(t 'DEMO: пример с вымышленными данными.' 'DEMO: synthetic data.')"
+}
+
 main() {
+ local hostname memory wireless
  [ -r "$BASE/language" ] || language
  while :; do
-  say "━━ OWRT POCKET $VERSION ━━"
-  printf '%s\n' "$(get system.@system[0].hostname)"
-  free | awk 'NR==2{printf "RAM: %d / %d MiB\n",$3/1024,$2/1024}'
+  dashboard_screen
+  panel "OWRT POCKET $VERSION"
+  hostname=$(get 'system.@system[0].hostname' | display_text)
+  field "$(t 'Роутер' 'Router')" "${hostname:-OpenWrt}"
+  memory=$(ram_usage)
+  set -- $memory
+  meter "$(t 'ОЗУ' 'RAM')" "${1:-}" "${2:-—} / ${3:-—} MiB"
+  wireless=$(ubus call network.wireless status 2>/dev/null || :)
+  field 'Wi-Fi' "$(wifi_badge "$(json_value "$wireless" '@.*.up')")"
   [ -z "$(pending_id)" ] || printf '%s%s%s\n' "$Y" "$(t 'ОЖИДАЕТ ПОДТВЕРЖДЕНИЯ: owp confirm' 'PENDING: owp confirm')" "$Z"
   [ ! -r "$BASE/repeater-result" ] || cat "$BASE/repeater-result"
-  t '1 Состояние роутера' '1 Router status'
-  t '2 Клиенты и привязки IP' '2 Clients and IP reservations'
-  t '3 Интерфейсы и трафик' '3 Interfaces and traffic'
-  printf '4 Wi-Fi\n'
-  t '5 Диагностика сети' '5 Network diagnostics'
-  t '6 Исправления и VPN' '6 Repairs and VPN'
-  t '7 Интернет / повторитель / LAN IP' '7 Internet / repeater / LAN IP'
-  t '8 Пакеты' '8 Packages'
-  t '9 Настройки и подтверждение' '9 Settings and confirmation'
-  t '0 Выход' '0 Exit'
-  ask '>' || break
+  printf '\n'
+  menu_options
+  printf '\n'
+  ask "$(t 'Выберите номер ›' 'Choose a number ›')" || break
   case "$ANSWER" in
-   1) status;; 2) client_menu;; 3) interfaces;; 4) wifi_menu;;
-   5) doctor; say "$(t '1 Сканировать LAN | 0 Назад' '1 Scan LAN | 0 Back')"; ask '>' && [ "$ANSWER" = 1 ] && lan_scan;;
+   0) break;;
+   1|2|3|4|5|6|7|8|9) dashboard_screen;;
+   *) continue;;
+  esac
+  case "$ANSWER" in
+   1) status;; 2) client_menu;; 3) traffic_menu;; 4) wifi_menu;; 5) doctor_menu;;
    6) repair;; 7) wan_setup;; 8) packages;;
    9)
-    say "$(t '1 Язык | 2 Пароль root | 3 Подтвердить | 4 Откатить | 0 Назад' '1 Language | 2 Root password | 3 Confirm | 4 Roll back | 0 Back')"
-    ask '>' || break
-    case "$ANSWER" in 1) language;; 2) say "$(t 'Пароль не откатывается автоматически.' 'Password changes have no automatic rollback.')"; yes && passwd root;; 3) confirm;; 4) yes && rollback "$(pending_id)";; esac;;
-   0) break;; *) continue;;
+    option 1 "$(t 'Язык' 'Language')"
+    option 2 "$(t 'Пароль root' 'Root password')"
+    option 3 "$(t 'Подтвердить изменение' 'Confirm change')"
+    option 4 "$(t 'Откатить изменение' 'Roll back change')"
+    option 0 "$(t 'Назад' 'Back')"
+    ask '›' || break
+    case "$ANSWER" in 0) continue;; 1) language;; 2) say "$(t 'Пароль не откатывается автоматически.' 'Password changes have no automatic rollback.')"; yes && passwd root;; 3) confirm;; 4) yes && rollback "$(pending_id)";; esac;;
   esac
+  case "${ANSWER:-}" in 0) continue;; esac
   pause
  done
 }
+
+traffic_menu() {
+ while :; do
+  interfaces
+  printf '\n'
+  option 1 "$(t 'Обновить замер' 'Measure again')"
+  option 0 "$(t 'Назад' 'Back')"
+  ask '›' || return
+  [ "$ANSWER" = 1 ] || return
+  dashboard_screen
+ done
+}
+
+doctor_menu() {
+ doctor_summary
+ printf '\n'
+ option 1 "$(t 'Сканировать LAN' 'Scan LAN')"
+ option 2 "$(t 'Технические подробности и журнал' 'Technical details and log')"
+ option 0 "$(t 'Назад' 'Back')"
+ ask '›' || return
+ case "$ANSWER" in 1) lan_scan;; 2) doctor_details;; esac
+}
+
+
 if [ "${OWP_SOURCE_ONLY:-0}" = 1 ]; then return 0; fi
-case "${1:-}" in demo|--demo) demo; exit;; --version) printf '%s\n' "$VERSION"; exit;; esac
+case "${1:-}" in demo|--demo) demo "${2:-}"; exit;; --version) printf '%s\n' "$VERSION"; exit;; esac
 need_root
 [ -f /etc/openwrt_release ] || { bad 'OpenWrt required (try: owp demo)'; exit 1; }
 mkdir -p "$BASE/transactions"
@@ -693,7 +1052,7 @@ cleanup() { stty echo 2>/dev/null || :; rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
 case "${1:-}" in
- '') main;; status) status;; clients) clients;; interfaces) interfaces;; doctor) doctor;; scan) lan_scan;;
+ '') main;; status) status;; clients) clients;; interfaces) interfaces;; doctor) if [ "${2:-}" = --details ]; then doctor_details; else doctor_summary; fi;; scan) lan_scan;;
  internet) wan_setup;; repeater) repeater_setup;; repeater-status) repeater_status;; lan) lan_setup;;
  *) printf 'owp [status|clients|interfaces|doctor|scan|internet|repeater|repeater-status|lan|confirm|rollback|demo|--version]\n'; exit 1;;
 esac
